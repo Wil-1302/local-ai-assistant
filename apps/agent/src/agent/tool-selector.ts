@@ -2,6 +2,7 @@
  * Auto tool selection — priority-based intent routing for automatic tool invocation.
  *
  * Priority order (highest wins):
+ *   L0 LOG   — log file path detected, or log-analysis intent + path
  *   L1 READ  — concrete file path with extension detected
  *   L2 LS    — directory / project structure intent
  *   L3 PS    — process / performance intent
@@ -17,6 +18,54 @@ export interface AutoToolCall {
   args: Record<string, string>;
   /** Short label shown to the user: [tool] executing: <label> */
   label: string;
+}
+
+// ── Log helpers ───────────────────────────────────────────────────────────────
+
+/**
+ * Extensions and path patterns that identify a file as a log.
+ * Used to route `.log` / `.err` / etc. paths to read_log instead of read_file.
+ */
+const LOG_EXTENSIONS = new Set([".log", ".err", ".out", ".error", ".access"]);
+
+/** Path segments that strongly indicate a log directory. */
+const LOG_PATH_SEGMENTS = ["/log/", "/logs/", "/var/log", "/tmp/log"];
+
+/**
+ * Keywords that express log-analysis intent.
+ * Only trigger read_log when combined with a detectable file path.
+ */
+const LOG_INTENT_KEYWORDS: string[] = [
+  // Spanish
+  "analiza este log",
+  "analiza el log",
+  "analiza los logs",
+  "revisa este log",
+  "revisa el log",
+  "qué error hay en",
+  "qué errores hay en",
+  "qué hay en el log",
+  "mira este log",
+  "mira el log",
+  "mira este archivo de log",
+  "errores del log",
+  "busca errores en",
+  // English
+  "analyze this log",
+  "analyze the log",
+  "check this log",
+  "check the log",
+  "what errors in",
+  "what's in the log",
+  "read this log",
+  "look at this log",
+];
+
+function isLogPath(filePath: string): boolean {
+  const ext = filePath.slice(filePath.lastIndexOf(".")).toLowerCase();
+  if (LOG_EXTENSIONS.has(ext)) return true;
+  const lower = filePath.toLowerCase();
+  return LOG_PATH_SEGMENTS.some((seg) => lower.includes(seg));
 }
 
 // ── Keyword tables ────────────────────────────────────────────────────────────
@@ -145,8 +194,25 @@ function hasAny(text: string, keywords: string[]): boolean {
 export function detectToolCall(message: string): AutoToolCall | null {
   const text = message.toLowerCase().trim();
 
-  // ── L1: READ — highest priority ───────────────────────────────────────────
-  // Try verb+file pattern first (most specific), then bare filename.
+  // ── L0: LOG — highest priority ────────────────────────────────────────────
+  // Fire when a log-looking path is found, or log-intent keywords + any path.
+  const hasLogIntent = hasAny(text, LOG_INTENT_KEYWORDS);
+  for (const pattern of READ_PATTERNS) {
+    const match = message.match(pattern);
+    if (match?.[1]) {
+      const filePath = match[1].replace(/['"]/g, "");
+      if (isLogPath(filePath) || hasLogIntent) {
+        debug("log", `read_log(${filePath})`);
+        return {
+          toolName: "read_log",
+          args: { path: filePath },
+          label: `log ${filePath}`,
+        };
+      }
+    }
+  }
+
+  // ── L1: READ — concrete file path with extension ──────────────────────────
   for (const pattern of READ_PATTERNS) {
     const match = message.match(pattern);
     if (match?.[1]) {

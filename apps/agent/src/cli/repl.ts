@@ -8,14 +8,15 @@ import { detectToolCall, type AutoToolCall } from "../agent/tool-selector.js";
 
 const HELP = `
 Commands:
-  /help           Show this help
-  /clear          Clear conversation history
-  /history        Show number of conversation turns
-  /model          Show current model
-  /read <path>    Read a file and load it into context
-  /ls [path]      List directory contents (default: current dir)
-  /ps [filter]    List running processes (optional text filter)
-  /exit           Exit (also: exit, quit, Ctrl+D)
+  /help              Show this help
+  /clear             Clear conversation history
+  /history           Show number of conversation turns
+  /model             Show current model
+  /read <path>       Read a file and load it into context
+  /log <path> [N]    Read last N lines of a log file (default: 50)
+  /ls [path]         List directory contents (default: current dir)
+  /ps [filter]       List running processes (optional text filter)
+  /exit              Exit (also: exit, quit, Ctrl+D)
 `;
 
 const RULE_WIDTH = 60;
@@ -134,7 +135,46 @@ export class Repl {
       this.agent.injectContext(
         `Here is the content of \`${resolved}\`:\n\n\`\`\`\n${ctx}\n\`\`\``
       );
+    } else if (call.toolName === "read_log") {
+      this.agent.injectContext(`Log content of \`${call.args["path"] ?? ""}\`:\n\n${ctx}`);
     }
+  }
+
+  private async handleLog(input: string): Promise<void> {
+    const parts = input.slice("/log".length).trim().split(/\s+/);
+    const filePath = parts[0];
+    if (!filePath) {
+      console.log("Usage: /log <path> [lines]\n");
+      return;
+    }
+    const lines = parts[1] ?? "";
+
+    const resolved = path.resolve(process.cwd(), filePath);
+
+    const result = await this.tools.execute(
+      "read_log",
+      lines ? { path: filePath, lines } : { path: filePath },
+      { cwd: process.cwd() }
+    );
+
+    if (result.error) {
+      console.log(`[error] ${result.error}\n`);
+      this.logger.warn(`/log failed: ${result.error}`);
+      return;
+    }
+
+    const lineCount = result.output.split("\n").length;
+    const header = `─── log: ${resolved} (${lineCount} líneas) `;
+    const pad = Math.max(0, RULE_WIDTH - header.length);
+
+    console.log(`\n${header}${"─".repeat(pad)}`);
+    console.log(result.output);
+    console.log(rule());
+
+    const ctx = result.contextOutput ?? result.output;
+    this.agent.injectContext(`Log content of \`${resolved}\`:\n\n${ctx}`);
+    console.log("[Log cargado en contexto. Pregunta lo que necesites.]\n");
+    this.logger.info(`/log: loaded ${resolved} (${lineCount} lines)`);
   }
 
   private async handleRead(input: string): Promise<void> {
@@ -195,6 +235,12 @@ export class Repl {
 
         if (input.startsWith("/read")) {
           await this.handleRead(input);
+          loop();
+          return;
+        }
+
+        if (input.startsWith("/log")) {
+          await this.handleLog(input);
           loop();
           return;
         }
