@@ -1,9 +1,28 @@
 import fs from "fs";
 import path from "path";
 import type { Tool, ToolContext, ToolResult } from "../types.js";
+import { config } from "../../config.js";
 
 const MAX_BYTES = 100 * 1024; // 100 KB
 const MAX_LINES = 1000;
+
+/**
+ * Resolve a (possibly relative) file path.
+ * For relative paths, try cwd first; if not found there, try project root.
+ * Returns the best candidate path (may still not exist).
+ */
+function resolveFilePath(filePath: string, cwd: string): string {
+  if (path.isAbsolute(filePath)) return filePath;
+
+  const fromCwd = path.resolve(cwd, filePath);
+  if (fs.existsSync(fromCwd)) return fromCwd;
+
+  const fromProject = path.resolve(config.projectRoot, filePath);
+  if (fs.existsSync(fromProject)) return fromProject;
+
+  // Neither exists — return cwd-based path so the error message is predictable
+  return fromCwd;
+}
 
 export class ReadFileTool implements Tool {
   readonly name = "read_file";
@@ -19,14 +38,14 @@ export class ReadFileTool implements Tool {
       return { output: "", error: "Missing required argument: path" };
     }
 
-    const resolved = path.resolve(ctx.cwd, filePath);
+    const resolved = resolveFilePath(filePath, ctx.cwd);
 
     // Check existence and read permissions
     try {
       fs.accessSync(resolved, fs.constants.R_OK);
     } catch {
       if (!fs.existsSync(resolved)) {
-        return { output: "", error: `File not found: ${resolved}` };
+        return { output: "", error: `File not found: ${filePath}` };
       }
       return { output: "", error: `Permission denied: ${resolved}` };
     }
