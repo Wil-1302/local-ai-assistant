@@ -134,9 +134,35 @@ export class ReadLogTool implements Tool {
 
     const header = `${resolved} — últimas ${lines.length} líneas${chunkNote}`;
 
+    // Extract error/warn lines for a structured summary injected into context
+    const errorLines = lines.filter((l) =>
+      /\b(ERROR|FATAL|CRITICAL)\b|Exception|Traceback|panic/i.test(l)
+    );
+    const warnLines = lines.filter((l) => /\bWARN(ING)?\b/i.test(l));
+
+    let summary: string;
+    if (errorLines.length > 0) {
+      const listed = errorLines
+        .slice(0, 10)
+        .map((l) => `  - ${l.trim()}`)
+        .join("\n");
+      summary = `\n\n[Análisis automático]\nErrores encontrados: ${errorLines.length}\n${listed}`;
+      if (warnLines.length > 0) {
+        summary += `\nWarnings: ${warnLines.length}`;
+      }
+    } else if (warnLines.length > 0) {
+      const listed = warnLines
+        .slice(0, 5)
+        .map((l) => `  - ${l.trim()}`)
+        .join("\n");
+      summary = `\n\n[Análisis automático]\nSin errores. Warnings: ${warnLines.length}\n${listed}`;
+    } else {
+      summary = `\n\n[Análisis automático]\nSin errores ni warnings detectados.`;
+    }
+
     return {
       output: content,
-      contextOutput: `${header}\n\n${content}`,
+      contextOutput: `${header}\n\n${content}${summary}`,
     };
   }
 }

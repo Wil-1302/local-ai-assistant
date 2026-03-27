@@ -162,6 +162,8 @@ const PS_EXCLUSION_KEYWORDS: string[] = [
 
 /** Patterns that extract a file path from a read-intent message. */
 const READ_PATTERNS: RegExp[] = [
+  // Absolute path — must come first so the leading "/" is never stripped by \b
+  /(?:^|\s)(\/[^\s,;'"]+\.[a-zA-Z0-9]{1,6})/,
   // Spanish: lee / leer / abre / revisa / muestra / carga + optional "el archivo" + filename.ext
   /\b(?:lee|leer|abre|abrir|revisa|revisar|muestra|mostrar|carga|cargar)\s+(?:el\s+)?(?:archivo\s+)?([^\s,;'"]+\.[a-zA-Z0-9]+)/i,
   // English: read / open / show / load / check + optional "the file" + filename.ext

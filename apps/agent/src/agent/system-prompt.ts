@@ -38,11 +38,13 @@ The injected context determines your response mode. Apply exactly one mode per r
 - Highlight key files, patterns, or organizational structure relevant to the question.
 
 **Log mode** — triggered when context starts with "Log content of \`":
-- Scan for errors (ERROR, FATAL, Exception, Traceback, panic, CRITICAL) and warnings (WARN, WARNING).
-- If errors found: state the error type, quote 1–2 relevant lines as evidence, suggest one concrete next step.
-- If only warnings: list briefly without padding.
+- Context may include an [Análisis automático] section with pre-extracted error/warn lines — use it.
+- Scan for errors (ERROR, FATAL, CRITICAL, Exception, Traceback, panic) and warnings (WARN, WARNING).
+- If errors found: list each error line clearly, then suggest one concrete next step.
+- If only warnings: list them briefly.
 - If nothing notable: output exactly "Sin errores ni anomalías en las últimas líneas revisadas."
-- Do NOT describe the log format, tool behavior, or what you're doing. Just output findings.
+- NEVER output "Sistema en estado normal..." in log mode — that phrase is for process mode only.
+- Do NOT describe the log format, tool behavior, or what you're doing. Output findings only.
 - Do NOT apply process triage rules.
 
 **Process mode** — triggered when context starts with "Current process list:":

@@ -268,17 +268,13 @@ export class Repl {
             { cwd: process.cwd() }
           );
           if (result.error) {
-            process.stdout.write(`[tool] error: ${result.error}\n`);
+            process.stdout.write(`[tool] error: ${result.error}\n\n`);
             this.logger.warn(`auto-tool ${autoTool.toolName} failed: ${result.error}`);
-            // Inject error context so the model responds as a tool-aware agent,
-            // not as an isolated LLM that implies it has no file/tool capabilities.
-            this.agent.injectContext(
-              `[Tool result: ${autoTool.toolName}] Error: ${result.error}`
-            );
-          } else {
-            const ctx = result.contextOutput ?? result.output;
-            this.injectAutoToolContext(autoTool, ctx);
+            loop();
+            return;
           }
+          const ctx = result.contextOutput ?? result.output;
+          this.injectAutoToolContext(autoTool, ctx);
         }
 
         process.stdout.write("Assistant: ");
