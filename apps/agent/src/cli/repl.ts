@@ -86,7 +86,7 @@ export class Repl {
     console.log(rule() + "\n");
 
     const ctx = result.contextOutput ?? result.output;
-    this.agent.injectContext(ctx);
+    this.agent.injectContext(`Directory listing of \`${resolved}\`:\n\n${ctx}`);
     console.log("[Directory loaded into context. Ask anything about it.]\n");
     this.logger.info(`/ls: listed ${resolved}`);
   }
@@ -127,7 +127,8 @@ export class Repl {
     if (call.toolName === "list_processes") {
       this.agent.injectContext(`Current process list:\n\n${ctx}`);
     } else if (call.toolName === "list_dir") {
-      this.agent.injectContext(ctx);
+      const resolvedDir = path.resolve(process.cwd(), call.args["path"] ?? ".");
+      this.agent.injectContext(`Directory listing of \`${resolvedDir}\`:\n\n${ctx}`);
     } else if (call.toolName === "read_file") {
       const resolved = path.resolve(process.cwd(), call.args["path"] ?? "");
       this.agent.injectContext(
