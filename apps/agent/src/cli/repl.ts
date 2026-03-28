@@ -18,6 +18,10 @@ Commands:
   /ps [filter]       List running processes (optional text filter)
   /service <name>    Show systemd service status (systemctl status)
   /journal [svc] [N] Read systemd journal (service optional, default 50 lines)
+  /ping <host>       Ping a host (ping -c 4)
+  /dns <host>        DNS lookup for a host (getent hosts)
+  /http <url>        Check HTTP headers of a URL (curl -I --max-time 10)
+  /check web <host>  Composite web check: DNS + ping + HTTP → summary
 
 Actions (require confirmation):
   /restart <service> Restart a systemd service (systemctl restart)
@@ -240,7 +244,175 @@ export class Repl {
       call.toolName === "net_routes"
     ) {
       this.agent.injectContext(`Network data:\n\n${ctx}`);
+    } else if (
+      call.toolName === "ping_host" ||
+      call.toolName === "dns_lookup" ||
+      call.toolName === "http_head_check"
+    ) {
+      this.agent.injectContext(`Network check:\n\n${ctx}`);
     }
+  }
+
+  private async handlePing(input: string): Promise<void> {
+    const host = input.slice("/ping".length).trim();
+    if (!host) {
+      console.log("Usage: /ping <host>\n");
+      return;
+    }
+
+    const result = await this.tools.execute(
+      "ping_host",
+      { host },
+      { cwd: process.cwd() }
+    );
+
+    if (result.error) {
+      console.log(`[error] ${result.error}\n`);
+      this.logger.warn(`/ping failed: ${result.error}`);
+      return;
+    }
+
+    const header = `─── ping: ${host} `;
+    const pad = Math.max(0, RULE_WIDTH - header.length);
+    console.log(`\n${header}${"─".repeat(pad)}`);
+    console.log(result.output);
+    console.log(rule() + "\n");
+
+    const ctx = result.contextOutput ?? result.output;
+    this.agent.injectContext(`Network check:\n\n${ctx}`);
+    console.log("[Ping result loaded into context. Ask anything about it.]\n");
+    this.logger.info(`/ping: ${host}`);
+  }
+
+  private async handleDns(input: string): Promise<void> {
+    const host = input.slice("/dns".length).trim();
+    if (!host) {
+      console.log("Usage: /dns <host>\n");
+      return;
+    }
+
+    const result = await this.tools.execute(
+      "dns_lookup",
+      { host },
+      { cwd: process.cwd() }
+    );
+
+    if (result.error) {
+      console.log(`[error] ${result.error}\n`);
+      this.logger.warn(`/dns failed: ${result.error}`);
+      return;
+    }
+
+    const header = `─── dns: ${host} `;
+    const pad = Math.max(0, RULE_WIDTH - header.length);
+    console.log(`\n${header}${"─".repeat(pad)}`);
+    console.log(result.output);
+    console.log(rule() + "\n");
+
+    const ctx = result.contextOutput ?? result.output;
+    this.agent.injectContext(`Network check:\n\n${ctx}`);
+    console.log("[DNS result loaded into context. Ask anything about it.]\n");
+    this.logger.info(`/dns: ${host}`);
+  }
+
+  private async handleWebCheck(target: string): Promise<void> {
+    if (!target) {
+      console.log("Usage: /check web <host-or-url>\n");
+      return;
+    }
+
+    // Extract host from URL (https://foo.com/path) or treat as bare hostname
+    const urlMatch = target.match(/^https?:\/\/([^/]+)/i);
+    const host = urlMatch?.[1] ?? target;
+    const httpUrl = urlMatch ? target : `https://${target}`;
+
+    const ctxParts: string[] = [];
+
+    // Step 1: DNS
+    process.stdout.write(`[tool] executing: getent hosts ${host}\n`);
+    const dnsResult = await this.tools.execute("dns_lookup", { host }, { cwd: process.cwd() });
+    if (dnsResult.error) {
+      console.log(`[error] dns: ${dnsResult.error}\n`);
+      this.logger.warn(`/check web dns failed: ${dnsResult.error}`);
+      return;
+    }
+    ctxParts.push(dnsResult.contextOutput ?? dnsResult.output);
+
+    // Step 2: Ping (non-fatal — unreachable is a valid result)
+    process.stdout.write(`[tool] executing: ping -c 4 ${host}\n`);
+    const pingResult = await this.tools.execute("ping_host", { host }, { cwd: process.cwd() });
+    if (pingResult.error) {
+      ctxParts.push(`[PING: ${host}]\n${pingResult.error}`);
+      this.logger.warn(`/check web ping: ${pingResult.error}`);
+    } else {
+      ctxParts.push(pingResult.contextOutput ?? pingResult.output);
+    }
+
+    // Step 3: HTTP (non-fatal — connection error is a valid result)
+    process.stdout.write(`[tool] executing: curl -I ${httpUrl}\n`);
+    const httpResult = await this.tools.execute("http_head_check", { url: httpUrl }, { cwd: process.cwd() });
+    if (httpResult.error) {
+      ctxParts.push(`[HTTP_HEAD: ${httpUrl}]\n${httpResult.error}`);
+      this.logger.warn(`/check web http: ${httpResult.error}`);
+    } else {
+      ctxParts.push(httpResult.contextOutput ?? httpResult.output);
+    }
+
+    const header = `─── web check: ${target} `;
+    const pad = Math.max(0, RULE_WIDTH - header.length);
+    console.log(`\n${header}${"─".repeat(pad)}`);
+    console.log(rule() + "\n");
+
+    this.agent.injectContext(`Network check:\n\n${ctxParts.join("\n\n")}`);
+
+    process.stdout.write("Assistant: ");
+    try {
+      await this.agent.send(
+        `Resume el check web para "${target}": DNS OK/FAIL, Ping OK/FAIL, HTTP OK/FAIL, conclusión.`,
+        (token) => { process.stdout.write(token); }
+      );
+      process.stdout.write("\n\n");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stdout.write(`\n[error] ${msg}\n\n`);
+      this.logger.error("/check web agent call failed", err);
+    }
+    this.logger.info(`/check web: ${target}`);
+  }
+
+  private async handleHttp(input: string): Promise<void> {
+    const url = input.slice("/http".length).trim();
+    if (!url) {
+      console.log("Usage: /http <url>\n");
+      return;
+    }
+
+    const result = await this.tools.execute(
+      "http_head_check",
+      { url },
+      { cwd: process.cwd() }
+    );
+
+    if (result.error) {
+      console.log(`[error] ${result.error}\n`);
+      this.logger.warn(`/http failed: ${result.error}`);
+      return;
+    }
+
+    const header = `─── http head: ${url} `;
+    const pad = Math.max(0, RULE_WIDTH - header.length);
+    console.log(`\n${header}${"─".repeat(pad)}`);
+    console.log(result.output);
+    console.log(rule() + "\n");
+
+    const ctx = result.contextOutput ?? result.output;
+    this.agent.injectContext(`Network check:\n\n${ctx}`);
+    console.log("[HTTP headers loaded into context. Ask anything about them.]\n");
+    this.logger.info(`/http: ${url}`);
+  }
+
+  private isBackend(service: string): boolean {
+    return service === config.backendService;
   }
 
   private confirm(message: string): Promise<boolean> {
@@ -271,6 +443,12 @@ export class Repl {
     }
 
     console.log(result.output + "\n");
+    if (this.isBackend(service)) {
+      console.log(
+        `[!] Acción ejecutada sobre el backend del agente. La sesión puede interrumpirse.\n` +
+        `    Verifica manualmente con \`systemctl status ${service}\` o vuelve a abrir el agente.\n`
+      );
+    }
     this.logger.info(`/restart: ${service}`);
   }
 
@@ -373,6 +551,23 @@ export class Repl {
       return;
     }
 
+    const statusText = [statusResult.error, statusResult.output, statusResult.contextOutput]
+      .filter(Boolean)
+      .join("\n");
+    if (/not\s+found|could not be found|Unit .+ not found/i.test(statusText)) {
+      console.log(`El servicio "${service}" no existe.\n`);
+      this.logger.warn(`/fix: service not found — ${service}`);
+      return;
+    }
+
+    // Source of truth: systemctl output decides if action is needed
+    if (/Active:\s+active \(running\)/i.test(statusResult.output)) {
+      console.log(statusResult.contextOutput ?? statusResult.output);
+      console.log("No se requiere acción.\n");
+      this.logger.info(`/fix: ${service} — already running, no action needed`);
+      return;
+    }
+
     // Step 2: journalctl
     process.stdout.write(`[tool] executing: journalctl -u ${service}\n`);
     const journalResult = await this.tools.execute(
@@ -390,6 +585,30 @@ export class Repl {
     const statusCtx = statusResult.contextOutput ?? statusResult.output;
     const journalCtx = journalResult.contextOutput ?? journalResult.output;
     this.agent.injectContext(`Service data:\n\n${statusCtx}\n\n${journalCtx}`);
+
+    // If targeting the LLM backend, skip agent.send() — restarting it would
+    // cut the connection mid-flight and produce an empty [error].
+    if (this.isBackend(service)) {
+      console.log(statusCtx);
+      process.stdout.write(`[fix] restart_service "${service}"\n`);
+      const backendRestart = await this.tools.execute(
+        "restart_service",
+        { service },
+        { cwd: process.cwd(), confirm: this.confirm.bind(this) }
+      );
+      if (backendRestart.error) {
+        console.log(`[error] ${backendRestart.error}\n`);
+        this.logger.warn(`/fix restart failed: ${backendRestart.error}`);
+        return;
+      }
+      console.log(backendRestart.output + "\n");
+      console.log(
+        `[!] Acción ejecutada sobre el backend del agente. La sesión puede interrumpirse.\n` +
+        `    Verifica manualmente con \`systemctl status ${service}\` o vuelve a abrir el agente.\n`
+      );
+      this.logger.info(`/fix: restarted backend service ${service}`);
+      return;
+    }
 
     // Ask agent for diagnosis, capture full response
     let diagnosis = "";
@@ -412,17 +631,7 @@ export class Repl {
       return;
     }
 
-    // Detect restart recommendation from diagnosis text.
-    // Negative guard takes priority: explicit "no action" phrases block restart.
-    const noActionNeeded = /no se requiere acci[oó]n/i.test(diagnosis);
-    const explicitRestart = /\/restart\s+\S+|reiniciar/i.test(diagnosis);
-    const needsRestart = !noActionNeeded && explicitRestart;
-    if (!needsRestart) {
-      console.log("No se requiere acción.\n");
-      this.logger.info(`/fix: ${service} — no action needed`);
-      return;
-    }
-
+    // Service is not running — proceed to restart with mandatory confirmation
     // Execute restart via real tool with mandatory confirmation
     process.stdout.write(`[fix] restart_service "${service}"\n`);
     const restartResult = await this.tools.execute(
@@ -439,6 +648,29 @@ export class Repl {
 
     console.log(restartResult.output + "\n");
     this.logger.info(`/fix: restarted ${service}`);
+
+    // Step 4: verify service state after restart
+    process.stdout.write(`[tool] executing: systemctl status ${service}\n`);
+    const verifyResult = await this.tools.execute(
+      "systemctl_status",
+      { service },
+      { cwd: process.cwd() }
+    );
+
+    if (verifyResult.error) {
+      console.log(`[error] ${verifyResult.error}\n`);
+      this.logger.warn(`/fix verify failed: ${verifyResult.error}`);
+      return;
+    }
+
+    const recovered = /active \(running\)/i.test(verifyResult.output);
+    if (recovered) {
+      console.log(`Servicio recuperado correctamente.\n`);
+      this.logger.info(`/fix: ${service} recovered`);
+    } else {
+      console.log(`El problema persiste. Estado actual:\n${verifyResult.output}\n`);
+      this.logger.warn(`/fix: ${service} still not healthy after restart`);
+    }
   }
 
   private async handleLog(input: string): Promise<void> {
@@ -572,6 +804,35 @@ export class Repl {
 
         if (input.startsWith("/fix")) {
           await this.handleFix(input);
+          loop();
+          return;
+        }
+
+        if (input.startsWith("/check")) {
+          const sub = input.slice("/check".length).trim();
+          if (sub.startsWith("web")) {
+            await this.handleWebCheck(sub.slice("web".length).trim());
+          } else {
+            console.log("Usage: /check web <host-or-url>\n");
+          }
+          loop();
+          return;
+        }
+
+        if (input.startsWith("/ping")) {
+          await this.handlePing(input);
+          loop();
+          return;
+        }
+
+        if (input.startsWith("/dns")) {
+          await this.handleDns(input);
+          loop();
+          return;
+        }
+
+        if (input.startsWith("/http")) {
+          await this.handleHttp(input);
           loop();
           return;
         }

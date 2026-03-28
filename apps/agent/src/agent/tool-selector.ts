@@ -206,6 +206,35 @@ const NET_ROUTES_KEYWORDS: string[] = [
   "show routes",
 ];
 
+const PING_KEYWORDS: string[] = [
+  // Spanish
+  "haz ping", "hacer ping", "ping a", "prueba ping", "prueba la conexión a",
+  "prueba conectividad", "comprueba conexión", "conectividad a", "conectividad con",
+  "alcanzable", "llego a", "llega a",
+  // English
+  "ping", "check connectivity to", "is reachable", "can reach",
+];
+
+const DNS_KEYWORDS: string[] = [
+  // Spanish
+  "resuelve ", "resolución dns", "dns de ", "resuelve el host",
+  "qué ip tiene", "qué dirección tiene", "qué ip es",
+  "resolución de nombre", "lookup de",
+  // English
+  "dns lookup", "resolve ", "nslookup", "what ip is", "what ip does",
+  "dns resolve",
+];
+
+const HTTP_HEAD_KEYWORDS: string[] = [
+  // Spanish
+  "cabecera http", "cabeceras http", "cabecera de ", "cabeceras de ",
+  "revisa la cabecera", "revisa la url", "estado http de",
+  "responde la url", "qué responde", "qué devuelve",
+  // English
+  "http head", "http headers", "check url", "check the url",
+  "curl head", "http status of", "what does the url return",
+];
+
 const JOURNALCTL_KEYWORDS: string[] = [
   // Spanish
   "journalctl", "journal de", "journal del", "logs del servicio",
@@ -213,6 +242,43 @@ const JOURNALCTL_KEYWORDS: string[] = [
   // English
   "systemd logs", "journal log", "service journal",
 ];
+
+/** Patterns to extract a hostname or IP from a natural-language ping/dns message. */
+const HOST_PATTERNS: RegExp[] = [
+  // "ping a google.com" / "ping google.com"
+  /\bping\s+(?:a\s+)?([a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,})\b/i,
+  // "resuelve openai.com" / "resolve openai.com"
+  /\b(?:resuelve|resolve|nslookup|lookup\s+de)\s+([a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,})\b/i,
+  // "dns de google.com"
+  /\bdns\s+de\s+([a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,})\b/i,
+  // "conectividad a/con google.com"
+  /\bconectividad\s+(?:a|con)\s+([a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,})\b/i,
+  // "qué ip tiene google.com" / "qué ip es google.com"
+  /\bqu[eé]\s+ip\s+(?:tiene|es)\s+([a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,})\b/i,
+  // bare hostname.tld anywhere (last resort)
+  /\b([a-zA-Z0-9][a-zA-Z0-9.\-]{2,}\.[a-zA-Z]{2,})\b/i,
+];
+
+/** Patterns to extract an HTTP/HTTPS URL. */
+const URL_PATTERNS: RegExp[] = [
+  /(https?:\/\/[^\s,;'"]+)/i,
+];
+
+function extractHost(text: string): string | null {
+  for (const pattern of HOST_PATTERNS) {
+    const m = text.match(pattern);
+    if (m?.[1]) return m[1].toLowerCase();
+  }
+  return null;
+}
+
+function extractUrl(text: string): string | null {
+  for (const pattern of URL_PATTERNS) {
+    const m = text.match(pattern);
+    if (m?.[1]) return m[1];
+  }
+  return null;
+}
 
 /** Patterns to extract a service name from a natural-language message. */
 const SYSTEMCTL_SERVICE_PATTERNS: RegExp[] = [
@@ -369,6 +435,31 @@ function detectLsIntent(message: string): AutoToolCall | null {
  */
 export function detectToolChain(message: string): AutoToolCall[] {
   const text = message.toLowerCase().trim();
+
+  // Network connectivity — checked FIRST so domain/URL names don't fall into read_file
+  if (hasAny(text, HTTP_HEAD_KEYWORDS)) {
+    const url = extractUrl(text);
+    if (url) {
+      debug("http_head", `http_head_check(${url})`);
+      return [{ toolName: "http_head_check", args: { url }, label: `curl -I ${url}` }];
+    }
+  }
+
+  if (hasAny(text, PING_KEYWORDS)) {
+    const host = extractHost(text);
+    if (host) {
+      debug("ping", `ping_host(${host})`);
+      return [{ toolName: "ping_host", args: { host }, label: `ping -c 4 ${host}` }];
+    }
+  }
+
+  if (hasAny(text, DNS_KEYWORDS)) {
+    const host = extractHost(text);
+    if (host) {
+      debug("dns", `dns_lookup(${host})`);
+      return [{ toolName: "dns_lookup", args: { host }, label: `getent hosts ${host}` }];
+    }
+  }
 
   const lsCall = detectLsIntent(message);
   const readCall = detectReadIntent(message);

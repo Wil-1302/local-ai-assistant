@@ -32,6 +32,17 @@ export const config = {
   logPath: process.env["LOG_PATH"] ?? path.join(PROJECT_ROOT, "data/logs/agent.log"),
   dataDir: path.join(PROJECT_ROOT, "data"),
   projectRoot: PROJECT_ROOT,
+  // Service name that provides the LLM backend (e.g. "ollama").
+  // Actions targeting this service skip LLM-based steps to avoid self-interruption.
+  backendService: process.env["AGENT_BACKEND_SERVICE"] ?? "ollama",
+  // Services that may be restarted via sudo without a password.
+  // Must match the NOPASSWD rules in /etc/sudoers.d/local-ai-agent.
+  allowedRestartServices: new Set(
+    (process.env["ALLOWED_RESTART_SERVICES"] ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  ),
 } as const;
 
 export type Config = typeof config;
