@@ -1,5 +1,7 @@
 export interface ToolContext {
   cwd: string;
+  /** Interactive confirmation callback — required by action tools. */
+  confirm?: (message: string) => Promise<boolean>;
 }
 
 export interface ToolResult {

@@ -136,7 +136,7 @@ export class ReadLogTool implements Tool {
 
     // Extract error/warn lines for a structured summary injected into context
     const errorLines = lines.filter((l) =>
-      /\b(ERROR|FATAL|CRITICAL)\b|Exception|Traceback|panic/i.test(l)
+      /\b(ERRORS?|FATALS?|CRITICAL)\b|Exception|Traceback|panic|Segmentation fault/i.test(l)
     );
     const warnLines = lines.filter((l) => /\bWARN(ING)?\b/i.test(l));
 
@@ -146,18 +146,18 @@ export class ReadLogTool implements Tool {
         .slice(0, 10)
         .map((l) => `  - ${l.trim()}`)
         .join("\n");
-      summary = `\n\n[Análisis automático]\nErrores encontrados: ${errorLines.length}\n${listed}`;
+      summary = `\n\n[LOG_ERRORS_FOUND: ${errorLines.length}]\nDEBES listar estos errores en tu respuesta:\n${listed}`;
       if (warnLines.length > 0) {
-        summary += `\nWarnings: ${warnLines.length}`;
+        summary += `\n[LOG_WARNINGS: ${warnLines.length}]`;
       }
     } else if (warnLines.length > 0) {
       const listed = warnLines
         .slice(0, 5)
         .map((l) => `  - ${l.trim()}`)
         .join("\n");
-      summary = `\n\n[Análisis automático]\nSin errores. Warnings: ${warnLines.length}\n${listed}`;
+      summary = `\n\n[LOG_WARNINGS_ONLY: ${warnLines.length}]\nDEBES listar estos warnings en tu respuesta:\n${listed}`;
     } else {
-      summary = `\n\n[Análisis automático]\nSin errores ni warnings detectados.`;
+      summary = `\n\n[LOG_CLEAN: sin errores ni warnings detectados]`;
     }
 
     return {

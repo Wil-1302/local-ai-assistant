@@ -4,7 +4,7 @@ import { config } from "../config.js";
 import type { Agent } from "../agent/loop.js";
 import type { Logger } from "../logging/logger.js";
 import type { ToolRegistry } from "../tools/registry.js";
-import { detectToolCall, type AutoToolCall } from "../agent/tool-selector.js";
+import { detectToolChain, type AutoToolCall } from "../agent/tool-selector.js";
 
 const HELP = `
 Commands:
@@ -16,6 +16,15 @@ Commands:
   /log <path> [N]    Read last N lines of a log file (default: 50)
   /ls [path]         List directory contents (default: current dir)
   /ps [filter]       List running processes (optional text filter)
+  /service <name>    Show systemd service status (systemctl status)
+  /journal [svc] [N] Read systemd journal (service optional, default 50 lines)
+
+Actions (require confirmation):
+  /restart <service> Restart a systemd service (systemctl restart)
+  /kill <pid>        Send SIGTERM to a process by PID
+  /diagnose <svc>    Combined diagnosis: status + journal → summary + action suggestion
+  /fix <svc>         Diagnose a service and restart it if needed (uses real tools)
+
   /exit              Exit (also: exit, quit, Ctrl+D)
 `;
 
@@ -120,6 +129,83 @@ export class Repl {
     this.logger.info(`/ps: listed processes${filter ? ` filter="${filter}"` : ""}`);
   }
 
+  private async handleService(input: string): Promise<void> {
+    const service = input.slice("/service".length).trim();
+    if (!service) {
+      console.log("Usage: /service <name>\n");
+      return;
+    }
+
+    const result = await this.tools.execute(
+      "systemctl_status",
+      { service },
+      { cwd: process.cwd() }
+    );
+
+    if (result.error) {
+      console.log(`[error] ${result.error}\n`);
+      this.logger.warn(`/service failed: ${result.error}`);
+      return;
+    }
+
+    const header = `─── systemctl: ${service} `;
+    const pad = Math.max(0, RULE_WIDTH - header.length);
+
+    console.log(`\n${header}${"─".repeat(pad)}`);
+    console.log(result.output);
+    console.log(rule() + "\n");
+
+    const ctx = result.contextOutput ?? result.output;
+    this.agent.injectContext(`Service data:\n\n${ctx}`);
+    console.log("[Service status loaded into context. Ask anything about it.]\n");
+    this.logger.info(`/service: ${service}`);
+  }
+
+  private async handleJournal(input: string): Promise<void> {
+    const parts = input.slice("/journal".length).trim().split(/\s+/);
+    // First arg: if all digits → lines; otherwise → service
+    let service: string | undefined;
+    let lines: string | undefined;
+
+    if (parts[0]) {
+      if (/^\d+$/.test(parts[0])) {
+        lines = parts[0];
+      } else {
+        service = parts[0];
+        if (parts[1] && /^\d+$/.test(parts[1])) lines = parts[1];
+      }
+    }
+
+    const toolArgs: Record<string, string> = {};
+    if (service) toolArgs["service"] = service;
+    if (lines) toolArgs["lines"] = lines;
+
+    const result = await this.tools.execute(
+      "journalctl",
+      toolArgs,
+      { cwd: process.cwd() }
+    );
+
+    if (result.error) {
+      console.log(`[error] ${result.error}\n`);
+      this.logger.warn(`/journal failed: ${result.error}`);
+      return;
+    }
+
+    const label = service ? `journal: ${service}` : "journal";
+    const header = `─── ${label} `;
+    const pad = Math.max(0, RULE_WIDTH - header.length);
+
+    console.log(`\n${header}${"─".repeat(pad)}`);
+    console.log(result.output);
+    console.log(rule() + "\n");
+
+    const ctx = result.contextOutput ?? result.output;
+    this.agent.injectContext(`Service data:\n\n${ctx}`);
+    console.log("[Journal loaded into context. Ask anything about it.]\n");
+    this.logger.info(`/journal: ${service ?? "system"}`);
+  }
+
   /**
    * Injects the result of an auto-detected tool into the agent context,
    * using the same format as the corresponding manual slash commands.
@@ -137,7 +223,222 @@ export class Repl {
       );
     } else if (call.toolName === "read_log") {
       this.agent.injectContext(`Log content of \`${call.args["path"] ?? ""}\`:\n\n${ctx}`);
+    } else if (
+      call.toolName === "memory_status" ||
+      call.toolName === "disk_usage" ||
+      call.toolName === "system_info"
+    ) {
+      this.agent.injectContext(`System data:\n\n${ctx}`);
+    } else if (
+      call.toolName === "systemctl_status" ||
+      call.toolName === "journalctl"
+    ) {
+      this.agent.injectContext(`Service data:\n\n${ctx}`);
+    } else if (
+      call.toolName === "open_ports" ||
+      call.toolName === "net_interfaces" ||
+      call.toolName === "net_routes"
+    ) {
+      this.agent.injectContext(`Network data:\n\n${ctx}`);
     }
+  }
+
+  private confirm(message: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      this.rl.question(`${message} `, (answer) => {
+        resolve(answer.trim().toLowerCase() === "yes");
+      });
+    });
+  }
+
+  private async handleRestart(input: string): Promise<void> {
+    const service = input.slice("/restart".length).trim();
+    if (!service) {
+      console.log("Usage: /restart <service>\n");
+      return;
+    }
+
+    const result = await this.tools.execute(
+      "restart_service",
+      { service },
+      { cwd: process.cwd(), confirm: this.confirm.bind(this) }
+    );
+
+    if (result.error) {
+      console.log(`[error] ${result.error}\n`);
+      this.logger.warn(`/restart failed: ${result.error}`);
+      return;
+    }
+
+    console.log(result.output + "\n");
+    this.logger.info(`/restart: ${service}`);
+  }
+
+  private async handleKill(input: string): Promise<void> {
+    const pid = input.slice("/kill".length).trim();
+    if (!pid) {
+      console.log("Usage: /kill <pid>\n");
+      return;
+    }
+
+    const result = await this.tools.execute(
+      "kill_process",
+      { pid },
+      { cwd: process.cwd(), confirm: this.confirm.bind(this) }
+    );
+
+    if (result.error) {
+      console.log(`[error] ${result.error}\n`);
+      this.logger.warn(`/kill failed: ${result.error}`);
+      return;
+    }
+
+    console.log(result.output + "\n");
+    this.logger.info(`/kill: ${pid}`);
+  }
+
+  private async handleDiagnose(input: string): Promise<void> {
+    const service = input.slice("/diagnose".length).trim();
+    if (!service) {
+      console.log("Usage: /diagnose <service>\n");
+      return;
+    }
+
+    // Step 1: systemctl status
+    process.stdout.write(`[tool] executing: systemctl status ${service}\n`);
+    const statusResult = await this.tools.execute(
+      "systemctl_status",
+      { service },
+      { cwd: process.cwd() }
+    );
+    if (statusResult.error) {
+      console.log(`[error] ${statusResult.error}\n`);
+      this.logger.warn(`/diagnose systemctl failed: ${statusResult.error}`);
+      return;
+    }
+
+    // Step 2: journalctl
+    process.stdout.write(`[tool] executing: journalctl -u ${service}\n`);
+    const journalResult = await this.tools.execute(
+      "journalctl",
+      { service },
+      { cwd: process.cwd() }
+    );
+    if (journalResult.error) {
+      console.log(`[error] ${journalResult.error}\n`);
+      this.logger.warn(`/diagnose journalctl failed: ${journalResult.error}`);
+      return;
+    }
+
+    // Combine both into one Service data context block
+    const statusCtx = statusResult.contextOutput ?? statusResult.output;
+    const journalCtx = journalResult.contextOutput ?? journalResult.output;
+    this.agent.injectContext(`Service data:\n\n${statusCtx}\n\n${journalCtx}`);
+
+    // Ask the agent for a structured diagnosis — no action execution
+    process.stdout.write("Assistant: ");
+    try {
+      await this.agent.send(
+        `Diagnostica el servicio "${service}": resume el estado y los hallazgos del journal, ` +
+        `luego indica la acción concreta más adecuada. ` +
+        `Si recomiendas reiniciar, di exactamente: Recomendación: usa \`/restart ${service}\` para reiniciarlo.`,
+        (token) => { process.stdout.write(token); }
+      );
+      process.stdout.write("\n\n");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stdout.write(`\n[error] ${msg}\n\n`);
+      this.logger.error("Diagnose agent call failed", err);
+    }
+    this.logger.info(`/diagnose: ${service}`);
+  }
+
+  private async handleFix(input: string): Promise<void> {
+    const service = input.slice("/fix".length).trim();
+    if (!service) {
+      console.log("Usage: /fix <service>\n");
+      return;
+    }
+
+    // Step 1: systemctl status
+    process.stdout.write(`[tool] executing: systemctl status ${service}\n`);
+    const statusResult = await this.tools.execute(
+      "systemctl_status",
+      { service },
+      { cwd: process.cwd() }
+    );
+    if (statusResult.error) {
+      console.log(`[error] ${statusResult.error}\n`);
+      this.logger.warn(`/fix systemctl failed: ${statusResult.error}`);
+      return;
+    }
+
+    // Step 2: journalctl
+    process.stdout.write(`[tool] executing: journalctl -u ${service}\n`);
+    const journalResult = await this.tools.execute(
+      "journalctl",
+      { service },
+      { cwd: process.cwd() }
+    );
+    if (journalResult.error) {
+      console.log(`[error] ${journalResult.error}\n`);
+      this.logger.warn(`/fix journalctl failed: ${journalResult.error}`);
+      return;
+    }
+
+    // Inject combined context (same format as /diagnose)
+    const statusCtx = statusResult.contextOutput ?? statusResult.output;
+    const journalCtx = journalResult.contextOutput ?? journalResult.output;
+    this.agent.injectContext(`Service data:\n\n${statusCtx}\n\n${journalCtx}`);
+
+    // Ask agent for diagnosis, capture full response
+    let diagnosis = "";
+    process.stdout.write("Assistant: ");
+    try {
+      await this.agent.send(
+        `Diagnostica el servicio "${service}": resume el estado y los hallazgos del journal, ` +
+        `luego indica la acción concreta más adecuada. ` +
+        `Si recomiendas reiniciar, di exactamente: Recomendación: usa \`/restart ${service}\` para reiniciarlo.`,
+        (token) => {
+          process.stdout.write(token);
+          diagnosis += token;
+        }
+      );
+      process.stdout.write("\n\n");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stdout.write(`\n[error] ${msg}\n\n`);
+      this.logger.error("/fix agent call failed", err);
+      return;
+    }
+
+    // Detect restart recommendation from diagnosis text.
+    // Negative guard takes priority: explicit "no action" phrases block restart.
+    const noActionNeeded = /no se requiere acci[oó]n/i.test(diagnosis);
+    const explicitRestart = /\/restart\s+\S+|reiniciar/i.test(diagnosis);
+    const needsRestart = !noActionNeeded && explicitRestart;
+    if (!needsRestart) {
+      console.log("No se requiere acción.\n");
+      this.logger.info(`/fix: ${service} — no action needed`);
+      return;
+    }
+
+    // Execute restart via real tool with mandatory confirmation
+    process.stdout.write(`[fix] restart_service "${service}"\n`);
+    const restartResult = await this.tools.execute(
+      "restart_service",
+      { service },
+      { cwd: process.cwd(), confirm: this.confirm.bind(this) }
+    );
+
+    if (restartResult.error) {
+      console.log(`[error] ${restartResult.error}\n`);
+      this.logger.warn(`/fix restart failed: ${restartResult.error}`);
+      return;
+    }
+
+    console.log(restartResult.output + "\n");
+    this.logger.info(`/fix: restarted ${service}`);
   }
 
   private async handleLog(input: string): Promise<void> {
@@ -251,15 +552,52 @@ export class Repl {
           return;
         }
 
+        if (input.startsWith("/service")) {
+          await this.handleService(input);
+          loop();
+          return;
+        }
+
+        if (input.startsWith("/journal")) {
+          await this.handleJournal(input);
+          loop();
+          return;
+        }
+
+        if (input.startsWith("/diagnose")) {
+          await this.handleDiagnose(input);
+          loop();
+          return;
+        }
+
+        if (input.startsWith("/fix")) {
+          await this.handleFix(input);
+          loop();
+          return;
+        }
+
+        if (input.startsWith("/restart")) {
+          await this.handleRestart(input);
+          loop();
+          return;
+        }
+
+        if (input.startsWith("/kill")) {
+          await this.handleKill(input);
+          loop();
+          return;
+        }
+
         // Sync commands
         if (this.handleCommand(input)) {
           loop();
           return;
         }
 
-        // Auto tool detection — run at most one tool before generating response
-        const autoTool = detectToolCall(input);
-        if (autoTool) {
+        // Auto tool detection — at most 2 tools chained, abort on first error
+        const autoTools = detectToolChain(input);
+        let chainOk = true;
+        for (const autoTool of autoTools) {
           process.stdout.write(`[tool] executing: ${autoTool.label}\n`);
           this.logger.info(`auto-tool: ${autoTool.toolName}`);
           const result = await this.tools.execute(
@@ -270,12 +608,13 @@ export class Repl {
           if (result.error) {
             process.stdout.write(`[tool] error: ${result.error}\n\n`);
             this.logger.warn(`auto-tool ${autoTool.toolName} failed: ${result.error}`);
-            loop();
-            return;
+            chainOk = false;
+            break;
           }
           const ctx = result.contextOutput ?? result.output;
           this.injectAutoToolContext(autoTool, ctx);
         }
+        if (!chainOk) { loop(); return; }
 
         process.stdout.write("Assistant: ");
 

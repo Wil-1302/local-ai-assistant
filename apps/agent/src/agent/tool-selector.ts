@@ -2,10 +2,12 @@
  * Auto tool selection — priority-based intent routing for automatic tool invocation.
  *
  * Priority order (highest wins):
- *   L0 LOG   — log file path detected, or log-analysis intent + path
- *   L1 READ  — concrete file path with extension detected
- *   L2 LS    — directory / project structure intent
- *   L3 PS    — process / performance intent
+ *   L0 LOG        — log file path detected, or log-analysis intent + path
+ *   L1 READ       — concrete file path with extension detected
+ *   L2 LS         — directory / project structure intent
+ *   L3 SYSTEMCTL  — systemd service status query with service name
+ *   L4 JOURNALCTL — systemd journal query (service name optional)
+ *   L5 PS         — process / performance intent
  *
  * Semantic exclusions prevent cross-category false positives.
  * Conservative by design: ambiguous intent → null (no tool).
@@ -114,9 +116,9 @@ const PS_KEYWORDS: string[] = [
   "rendimiento",
   "carga del sistema",
   "qué pasa con el sistema",
-  "qué está corriendo",
+  "qué está corriendo",   // generic "what's running" — no service name
   "qué corre",
-  "corriendo",
+  // NOTE: bare "corriendo" removed — too ambiguous with "está corriendo <service>"
   // Spanish — direct process query
   "proceso",
   "procesos",
@@ -138,6 +140,130 @@ const PS_KEYWORDS: string[] = [
   "what's running",
   "consuming",
 ];
+
+const MEMORY_KEYWORDS: string[] = [
+  // Spanish
+  "memoria ram", "cuánta memoria", "uso de memoria", "estado de memoria",
+  "ram disponible", "ram libre", "ram usada", "memoria libre", "memoria usada",
+  "memoria disponible", "memoria del sistema",
+  // English
+  "memory usage", "ram usage", "free memory", "memory status", "how much memory",
+  "available memory", "memory free",
+];
+
+const DISK_KEYWORDS: string[] = [
+  // Spanish
+  "disco", "espacio en disco", "uso de disco", "espacio disponible",
+  "cuánto espacio", "particiones", "espacio libre",
+  // English
+  "disk usage", "disk space", "free disk", "storage", "filesystem",
+  "how much disk", "disk free", "df",
+];
+
+const SYSINFO_KEYWORDS: string[] = [
+  // Spanish
+  "información del sistema", "info del sistema", "kernel", "arquitectura",
+  "versión del sistema", "qué sistema", "qué kernel", "versión del kernel",
+  // English
+  "system info", "system information", "kernel version", "uname",
+  "architecture", "os version", "what kernel", "what system",
+];
+
+const SYSTEMCTL_KEYWORDS: string[] = [
+  // Spanish
+  "systemctl", "estado del servicio", "estado de servicio", "estado de", "estado del",
+  "servicio activo", "servicio caído", "servicio fallido",
+  "está activo", "está corriendo", "está caído", "está fallido", "unidad systemd",
+  // English
+  "service status", "is the service", "is running", "service active",
+  "service failed", "service down", "systemd unit",
+];
+
+const NET_PORTS_KEYWORDS: string[] = [
+  // Spanish
+  "puertos abiertos", "puertos escuchando", "qué puertos", "puertos en uso",
+  "puertos activos", "ss -tulpn", "netstat", "qué está escuchando",
+  // English
+  "open ports", "listening ports", "which ports", "ports in use",
+  "what ports", "what's listening",
+];
+
+const NET_INTERFACES_KEYWORDS: string[] = [
+  // Spanish
+  "interfaces de red", "interfaz de red", "ip a", "ip addr",
+  "direcciones ip", "configuración de red", "qué interfaces",
+  // English
+  "network interfaces", "ip address", "network config", "what interfaces",
+  "show interfaces",
+];
+
+const NET_ROUTES_KEYWORDS: string[] = [
+  // Spanish
+  "rutas de red", "tabla de rutas", "ip route", "rutas ip",
+  "gateway", "puerta de enlace", "enrutamiento",
+  // English
+  "routing table", "ip routes", "network routes", "default gateway",
+  "show routes",
+];
+
+const JOURNALCTL_KEYWORDS: string[] = [
+  // Spanish
+  "journalctl", "journal de", "journal del", "logs del servicio",
+  "logs de systemd", "logs del sistema",
+  // English
+  "systemd logs", "journal log", "service journal",
+];
+
+/** Patterns to extract a service name from a natural-language message. */
+const SYSTEMCTL_SERVICE_PATTERNS: RegExp[] = [
+  // "systemctl status <svc>" / "systemctl <svc>"
+  /\bsystemctl\s+(?:status\s+)?(\w[\w@:.-]*)\b/i,
+  // "status de sshd" / "status sshd"
+  /\bstatus\s+(?:de(?:l?\s+servicio)?\s+)?(\w[\w@:.-]*)/i,
+  // "estado de sshd" / "estado del sshd"
+  /\bestado\s+de[l]?\s+(?:servicio\s+)?(\w[\w@:.-]*)/i,
+  // "estado sshd" (fallback without preposition)
+  /\bestado\s+(?:de(?:l?\s+servicio)?\s+)?(\w[\w@:.-]*)/i,
+  // "está corriendo sshd" / "está activo sshd" (subject AFTER verb)
+  /\b(?:está|is)\s+(?:corriendo|running|activo|active|caído|down|fallido|failed)\s+(\w[\w@:.-]*)/i,
+  // "sshd está corriendo" / "sshd is running" (subject BEFORE verb)
+  /\b(\w[\w@:.-]*)\s+(?:está|is)\s+(?:activo|inactivo|corriendo|running|stopped|failed|caído)/i,
+  // "servicio sshd"
+  /\bservicio\s+(\w[\w@:.-]*)\b/i,
+  // "sshd status"
+  /\b(\w[\w@:.-]*)\s+status\b/i,
+];
+
+const JOURNALCTL_SERVICE_PATTERNS: RegExp[] = [
+  // "journalctl -u ollama" — \b removed because `-` is non-word char
+  /-u\s+(\w[\w@:.-]*)/i,
+  // "journalctl ollama" / "journal de sshd" — skip optional "-u" or preposition
+  /\bjournal(?:ctl)?\s+(?:-u\s+)?(?:de(?:l?\s+servicio)?\s+)?(\w[\w@:.-]*)/i,
+  // "ollama journal"
+  /\b(\w[\w@:.-]*)\s+journal\b/i,
+  // "logs del sshd" / "logs de sshd"
+  /\blogs\s+de[l]?\s+(?:servicio\s+)?(\w[\w@:.-]*)/i,
+];
+
+function extractServiceName(text: string, patterns: RegExp[]): string | null {
+  // Exclude terms that are not service names
+  const EXCLUDED = new Set([
+    // Articles / prepositions
+    "de", "del", "el", "la", "los", "las", "un", "una",
+    "the", "a", "an", "of",
+    // Generic nouns that are not service names
+    "status", "estado", "servicio", "service", "unit",
+    "sistema", "system", "memoria", "memory", "disco", "disk",
+    "kernel", "red", "network", "proceso", "process",
+  ]);
+  for (const pattern of patterns) {
+    const m = text.match(pattern);
+    if (m?.[1] && !EXCLUDED.has(m[1].toLowerCase())) {
+      return m[1].toLowerCase();
+    }
+  }
+  return null;
+}
 
 /**
  * Words that, when present, block PS from triggering.
@@ -188,59 +314,125 @@ function hasAny(text: string, keywords: string[]): boolean {
 
 // ── Detection ─────────────────────────────────────────────────────────────────
 
-/**
- * Detect whether a message implies automatic tool invocation.
- * Returns at most one tool call; priority: READ > LS > PS.
- * Returns null when intent is absent or ambiguous.
- */
-export function detectToolCall(message: string): AutoToolCall | null {
-  const text = message.toLowerCase().trim();
+// ── Single-intent detectors ───────────────────────────────────────────────
 
-  // ── L0: LOG — highest priority ────────────────────────────────────────────
-  // Fire when a log-looking path is found, or log-intent keywords + any path.
+/** Detects read/log intent only (L0 + L1). Does not match LS or PS. */
+function detectReadIntent(message: string): AutoToolCall | null {
+  const text = message.toLowerCase();
   const hasLogIntent = hasAny(text, LOG_INTENT_KEYWORDS);
+
+  // L0: log path or log-intent keyword + any path
   for (const pattern of READ_PATTERNS) {
     const match = message.match(pattern);
     if (match?.[1]) {
       const filePath = match[1].replace(/['"]/g, "");
       if (isLogPath(filePath) || hasLogIntent) {
         debug("log", `read_log(${filePath})`);
-        return {
-          toolName: "read_log",
-          args: { path: filePath },
-          label: `log ${filePath}`,
-        };
+        return { toolName: "read_log", args: { path: filePath }, label: `log ${filePath}` };
       }
     }
   }
 
-  // ── L1: READ — concrete file path with extension ──────────────────────────
+  // L1: concrete file path with extension
   for (const pattern of READ_PATTERNS) {
     const match = message.match(pattern);
     if (match?.[1]) {
       const filePath = match[1].replace(/['"]/g, "");
       debug("read", `read_file(${filePath})`);
-      return {
-        toolName: "read_file",
-        args: { path: filePath },
-        label: `read ${filePath}`,
-      };
+      return { toolName: "read_file", args: { path: filePath }, label: `read ${filePath}` };
     }
   }
 
-  // ── L2: LS — directory / structure intent ─────────────────────────────────
-  if (hasAny(text, LS_KEYWORDS)) {
+  return null;
+}
+
+/** Detects list_dir intent only (L2). */
+function detectLsIntent(message: string): AutoToolCall | null {
+  if (hasAny(message.toLowerCase(), LS_KEYWORDS)) {
     debug("ls", "list_dir");
     return { toolName: "list_dir", args: { path: "." }, label: "ls ." };
   }
+  return null;
+}
 
-  // ── L3: PS — process / performance intent ─────────────────────────────────
-  // Blocked when structural keywords are present to avoid misclassification.
+// ── Chain detection ───────────────────────────────────────────────────────
+
+/**
+ * Detect up to 2 auto tool calls from a single message.
+ *
+ * Chains supported:
+ *   list_dir → read_file
+ *   list_dir → read_log
+ *
+ * Guarantees: result length is 0, 1, or 2. Never more.
+ * Chain aborts in the caller on first tool error — no loops possible.
+ */
+export function detectToolChain(message: string): AutoToolCall[] {
+  const text = message.toLowerCase().trim();
+
+  const lsCall = detectLsIntent(message);
+  const readCall = detectReadIntent(message);
+
+  if (lsCall && readCall) return [lsCall, readCall];
+  if (readCall) return [readCall];
+  if (lsCall) return [lsCall];
+
+  // L3: systemctl — requires a service name to be useful
+  if (hasAny(text, SYSTEMCTL_KEYWORDS)) {
+    const service = extractServiceName(text, SYSTEMCTL_SERVICE_PATTERNS);
+    if (service) {
+      debug("systemctl", `systemctl_status(${service})`);
+      return [{ toolName: "systemctl_status", args: { service }, label: `systemctl status ${service}` }];
+    }
+  }
+
+  // L4: journalctl — service name optional
+  if (hasAny(text, JOURNALCTL_KEYWORDS)) {
+    const service = extractServiceName(text, JOURNALCTL_SERVICE_PATTERNS);
+    debug("journalctl", service ? `journalctl(${service})` : "journalctl");
+    return [{
+      toolName: "journalctl",
+      args: service ? { service } : {},
+      label: service ? `journalctl -u ${service}` : "journalctl",
+    }];
+  }
+
+  // L5: PS only when no structural exclusion is active
   if (hasAny(text, PS_KEYWORDS) && !hasAny(text, PS_EXCLUSION_KEYWORDS)) {
     debug("ps", "list_processes");
-    return { toolName: "list_processes", args: {}, label: "ps" };
+    return [{ toolName: "list_processes", args: {}, label: "ps" }];
+  }
+
+  if (hasAny(text, MEMORY_KEYWORDS)) {
+    debug("memory", "memory_status");
+    return [{ toolName: "memory_status", args: {}, label: "free -h" }];
+  }
+
+  if (hasAny(text, DISK_KEYWORDS)) {
+    debug("disk", "disk_usage");
+    return [{ toolName: "disk_usage", args: {}, label: "df -h" }];
+  }
+
+  if (hasAny(text, SYSINFO_KEYWORDS)) {
+    debug("sysinfo", "system_info");
+    return [{ toolName: "system_info", args: {}, label: "uname -a" }];
+  }
+
+  if (hasAny(text, NET_PORTS_KEYWORDS)) {
+    debug("net_ports", "open_ports");
+    return [{ toolName: "open_ports", args: {}, label: "ss -tulpn" }];
+  }
+
+  if (hasAny(text, NET_INTERFACES_KEYWORDS)) {
+    debug("net_ifaces", "net_interfaces");
+    return [{ toolName: "net_interfaces", args: {}, label: "ip a" }];
+  }
+
+  if (hasAny(text, NET_ROUTES_KEYWORDS)) {
+    debug("net_routes", "net_routes");
+    return [{ toolName: "net_routes", args: {}, label: "ip route" }];
   }
 
   debug("none", null);
-  return null;
+  return [];
 }
