@@ -1,8 +1,12 @@
 {
   "name": "agent",
   "version": "1.0.0",
-  "description": "",
+  "description": "Axis — local AI coding agent",
   "main": "index.js",
+  "bin": {
+    "axis": "bin/axis.js",
+    "jas": "bin/axis.js"
+  },
   "scripts": {
     "start": "tsx src/index.ts"
   },

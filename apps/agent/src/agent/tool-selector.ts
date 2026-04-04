@@ -70,6 +70,94 @@ function isLogPath(filePath: string): boolean {
   return LOG_PATH_SEGMENTS.some((seg) => lower.includes(seg));
 }
 
+// ── Edit intent ──────────────────────────────────────────────────────────────
+
+/**
+ * Returns true when a string looks like actual code / CSS / structured text
+ * rather than plain natural-language prose.
+ * Used to distinguish literal edits ("cambia color: red; por color: blue;")
+ * from semantic edits ("cambia el color del botón a azul").
+ */
+function looksLikeCode(s: string): boolean {
+  return /[{};:()"'=<>!@#$%^&*|\\]/.test(s);
+}
+
+/**
+ * Words that signal the user wants to EDIT or MODIFY part of an existing file.
+ * Must be checked BEFORE write detection to avoid routing edit → write_file.
+ *
+ * Includes structural rebuild verbs so instructions like
+ * "reconstruye el layout con sidebar en index.html" route to semantic edit
+ * instead of falling through to detectToolChain (read_file → LLM text response).
+ */
+const EDIT_KEYWORDS: string[] = [
+  // Spanish — incremental edit
+  "cambia", "cambiar", "modifica", "modificar", "edita", "editar",
+  "arregla", "arreglar", "corrige", "corregir", "actualiza", "actualizar",
+  "añade", "añadir", "agrega", "agregar", "reemplaza", "reemplazar",
+  "sustituye", "sustituir", "borra la línea", "elimina la línea",
+  // Spanish — structural rebuild (routes to semantic edit + structural assessment path)
+  "reconstruye", "reconstruir", "rehaz", "rehacer", "rehace",
+  "reestructura", "reestructurar",
+  "rediseña", "redisena", "rediseñar",
+  // English — incremental edit
+  "change", "modify", "edit", "fix", "update", "replace",
+  "add to", "append to", "remove from", "delete from",
+  "rename", "refactor",
+  // English — structural rebuild
+  "rebuild", "restructure", "redesign", "rewrite",
+];
+
+/** Patterns to extract the search (old) text from an edit-intent message. */
+const EDIT_SEARCH_PATTERNS: RegExp[] = [
+  // "cambia X a Y" / "change X to Y"
+  /\b(?:cambia|change|reemplaza|replace|sustituye|substitute)\s+["']?(.+?)["']?\s+(?:a|por|to|with)\s+["']?(.+?)["']?$/i,
+  // "modifica X por Y" / "update X to Y"
+  /\b(?:modifica|modifca|update|edita|edit)\s+["']?(.+?)["']?\s+(?:por|a|to|with)\s+["']?(.+?)["']?$/i,
+];
+
+// ── Write intent ─────────────────────────────────────────────────────────────
+
+/**
+ * Words that signal the user wants to CREATE or WRITE a file.
+ * Checked before read detection to prevent write → read_file misrouting.
+ */
+const WRITE_KEYWORDS: string[] = [
+  // Spanish
+  "crea", "crear", "genera", "generar", "escribe", "escribir",
+  "haz un archivo", "haz el archivo", "nuevo archivo",
+  // English
+  "create", "generate", "write a file", "write the file",
+  "create a file", "make a file", "new file",
+];
+
+/**
+ * Patterns to extract explicit inline content from write-intent messages.
+ * Tried in order; first match wins.
+ */
+const WRITE_CONTENT_PATTERNS: RegExp[] = [
+  /\bcon\s+contenido\s+(.+)$/i,
+  /\bcon\s+el\s+contenido\s+(.+)$/i,
+  /\bcon\s+el\s+texto\s+(.+)$/i,
+  /\bque\s+diga\s+(.+)$/i,
+  /\bque\s+contenga\s+(.+)$/i,
+  /\bwith\s+content\s+(.+)$/i,
+  /\bcontaining\s+(.+)$/i,
+  /\bwith\s+text\s+(.+)$/i,
+];
+
+/** System path prefixes blocked for write operations (mirrors write.ts). */
+const BLOCKED_WRITE_PREFIXES = [
+  "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64",
+  "/boot", "/sys", "/proc", "/dev", "/root",
+];
+
+function isBlockedWritePath(p: string): boolean {
+  return BLOCKED_WRITE_PREFIXES.some(
+    (prefix) => p === prefix || p.startsWith(prefix + "/")
+  );
+}
+
 // ── Keyword tables ────────────────────────────────────────────────────────────
 
 /**
@@ -378,6 +466,58 @@ function hasAny(text: string, keywords: string[]): boolean {
   return keywords.some((k) => text.includes(k));
 }
 
+// ── Write-path security check ─────────────────────────────────────────────────
+
+/** Matches any token that looks like an absolute path (with or without extension). */
+const ABSOLUTE_PATH_RE = /(?:^|\s)(\/\S+)/g;
+
+/**
+ * If the message has write intent AND references a blocked system path,
+ * returns an error string. Call this BEFORE detectToolChain so no tool runs.
+ */
+export function getBlockedWritePathError(message: string): string | null {
+  const text = message.toLowerCase();
+  if (!hasAny(text, WRITE_KEYWORDS)) return null;
+  const blocked = findBlockedAbsolutePath(message);
+  if (blocked) return `Ruta no permitida por seguridad: ${blocked}`;
+  return null;
+}
+
+/**
+ * Scan a message for any absolute path that falls under a blocked prefix.
+ * Uses a broad regex that matches extensionless paths like /etc/hosts too.
+ */
+function findBlockedAbsolutePath(message: string): string | null {
+  ABSOLUTE_PATH_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = ABSOLUTE_PATH_RE.exec(message)) !== null) {
+    const p = (m[1] ?? "").replace(/['"]/g, "").replace(/[,;]$/, "");
+    if (isBlockedWritePath(p)) return p;
+  }
+  // Also check READ_PATTERNS for paths already detected with extension
+  for (const pattern of READ_PATTERNS) {
+    const match = message.match(pattern);
+    if (match?.[1]) {
+      const p = match[1].replace(/['"]/g, "");
+      if (isBlockedWritePath(p)) return p;
+    }
+  }
+  return null;
+}
+
+/**
+ * If the message has edit intent AND references a blocked system path,
+ * returns an error string. Call this BEFORE detectToolChain so no tool runs
+ * and the LLM is never invoked with the request.
+ */
+export function getBlockedEditPathError(message: string): string | null {
+  const text = message.toLowerCase();
+  if (!hasAny(text, EDIT_KEYWORDS)) return null;
+  const blocked = findBlockedAbsolutePath(message);
+  if (blocked) return `Ruta no permitida por seguridad: ${blocked}`;
+  return null;
+}
+
 // ── Detection ─────────────────────────────────────────────────────────────────
 
 // ── Single-intent detectors ───────────────────────────────────────────────
@@ -406,6 +546,264 @@ function detectReadIntent(message: string): AutoToolCall | null {
       const filePath = match[1].replace(/['"]/g, "");
       debug("read", `read_file(${filePath})`);
       return { toolName: "read_file", args: { path: filePath }, label: `read ${filePath}` };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Find the first editable (non-log, non-blocked) file path mentioned in a message.
+ *
+ * Unlike iterating READ_PATTERNS directly, this function uses matchAll on the bare
+ * filename pattern so it can skip over false positives like `console.log` and keep
+ * looking for the actual target file (e.g. `script.js`).
+ *
+ * Priority:
+ *   1. Absolute path (first pattern)
+ *   2. Verb-prefixed filename (Spanish/English verb + filename)
+ *   3. All bare filename.ext matches in the message, skipping log paths
+ */
+function findEditableFilePath(message: string): string | null {
+  // Priority 1: absolute path
+  const absMatch = message.match(/(?:^|\s)(\/[^\s,;'"]+\.[a-zA-Z0-9]{1,6})/);
+  if (absMatch?.[1]) {
+    const p = absMatch[1].replace(/['"]/g, "");
+    if (!isLogPath(p) && !isBlockedWritePath(p)) return p;
+  }
+
+  // Priority 2: verb-prefixed filename (same sub-patterns as READ_PATTERNS[1] and [2])
+  const verbPatterns: RegExp[] = [
+    /\b(?:lee|leer|abre|abrir|revisa|revisar|muestra|mostrar|carga|cargar)\s+(?:el\s+)?(?:archivo\s+)?([^\s,;'"]+\.[a-zA-Z0-9]+)/i,
+    /\b(?:read|open|show|load|check)\s+(?:the\s+)?(?:file\s+)?([^\s,;'"]+\.[a-zA-Z0-9]+)/i,
+  ];
+  for (const pat of verbPatterns) {
+    const m = message.match(pat);
+    if (m?.[1]) {
+      const p = m[1].replace(/['"]/g, "");
+      if (!isLogPath(p) && !isBlockedWritePath(p)) return p;
+    }
+  }
+
+  // Priority 3: scan ALL bare filename.ext occurrences, skipping log paths
+  // This handles cases like "añade un console.log al inicio en script.js"
+  // where console.log is a method call, not the edit target.
+  const bareRe = /\b([a-zA-Z0-9_\-./]+\.[a-zA-Z]{2,5})\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = bareRe.exec(message)) !== null) {
+    const p = (m[1] ?? "").replace(/['"]/g, "");
+    if (!isLogPath(p) && !isBlockedWritePath(p)) return p;
+  }
+
+  return null;
+}
+
+/**
+ * Strip the file reference from a message to produce a clean instruction.
+ * Handles prepositions: "en", "in", "a" (Spanish "a <file>").
+ */
+function stripFileRef(message: string, filePath: string): string {
+  const escapedPath = filePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const fileArticle = `(?:el\\s+(?:archivo|fichero)|the\\s+file|the)?`;
+  return message
+    .replace(new RegExp(`\\s*\\b(?:en|in|a)\\b\\s+${fileArticle}\\s*${escapedPath}\\b`, "i"), " ")
+    .replace(new RegExp(`\\s+${escapedPath}\\b`, "i"), " ")
+    .trim();
+}
+
+/**
+ * Detects edit_file intent: user wants to change part of an existing file
+ * using literal search/replace text (must look like code, not prose).
+ * Returns null when no edit keyword or no file path is detected, or when
+ * the extracted search text is natural-language prose (→ semantic edit instead).
+ * Must run BEFORE detectWriteIntent so "modifica" doesn't fall into write_file.
+ */
+function detectEditIntent(message: string): AutoToolCall | null {
+  const text = message.toLowerCase();
+  if (!hasAny(text, EDIT_KEYWORDS)) return null;
+
+  const filePath = findEditableFilePath(message);
+  if (!filePath) return null;
+
+  const stripped = stripFileRef(message, filePath);
+
+  // Try to extract search/replace from structured patterns on the stripped message
+  let search = "";
+  let replace = "";
+  for (const ep of EDIT_SEARCH_PATTERNS) {
+    const em = stripped.match(ep);
+    if (em?.[1] && em?.[2]) {
+      search = em[1].trim();
+      replace = em[2].trim();
+      break;
+    }
+  }
+
+  // No literal search/replace found → semantic edit (handled separately)
+  if (!search) return null;
+
+  // If the search text doesn't look like code (e.g. "el color del botón"),
+  // the user is describing intent in prose → route to semantic edit instead.
+  if (!looksLikeCode(search)) return null;
+
+  debug("edit", `edit_file(${filePath})`);
+  return {
+    toolName: "edit_file",
+    args: { path: filePath, search, replace },
+    label: `edit ${filePath}`,
+  };
+}
+
+export interface SemanticEditIntent {
+  filePath: string;
+  /** The user's instruction with the file reference stripped out. */
+  instruction: string;
+}
+
+/**
+ * Detects semantic edit intent: user wants to change a file via natural language
+ * but without specifying exact search/replace text.
+ *
+ * Returns null when:
+ *   - no edit keywords present
+ *   - no editable file path found (log paths and blocked paths are skipped)
+ *   - a literal search/replace with code-like text IS extractable (→ detectEditIntent)
+ */
+export function detectSemanticEditIntent(message: string): SemanticEditIntent | null {
+  const text = message.toLowerCase();
+  if (!hasAny(text, EDIT_KEYWORDS)) return null;
+
+  const filePath = findEditableFilePath(message);
+  if (!filePath) return null;
+
+  const instruction = stripFileRef(message, filePath);
+
+  // Only defer to detectEditIntent when the extracted search text looks like code.
+  // Natural-language descriptions (no code chars) are semantic edits.
+  for (const ep of EDIT_SEARCH_PATTERNS) {
+    const em = instruction.match(ep);
+    if (em?.[1] && em?.[2] && looksLikeCode(em[1].trim())) return null;
+  }
+
+  debug("semantic_edit", `semantic_edit(${filePath})`);
+  return { filePath, instruction };
+}
+
+// ── Bugfix / refactor intent ──────────────────────────────────────────────────
+
+/**
+ * Keywords that signal a specific code bug/error that needs fixing.
+ * Only trigger when combined with an EDIT_KEYWORD (e.g. "arregla") to
+ * distinguish "arregla este bug en script.js" from "arregla el color…".
+ */
+const BUGFIX_SPECIFIC_KEYWORDS: string[] = [
+  // Spanish
+  "bug", "falla", "fallo",
+  "error en el código", "error en la función", "el error en",
+  "hay un bug", "tiene un bug", "hay un error", "el bug en",
+  // English
+  "fix the bug", "fix this bug", "there's a bug", "there is a bug",
+  "the bug in", "the error in", "debug",
+];
+
+/**
+ * Keywords that signal refactoring / code-quality improvement.
+ * These are standalone — no EDIT_KEYWORD required.
+ */
+const REFACTOR_KEYWORDS: string[] = [
+  // Spanish
+  "refactoriza", "refactorizar",
+  "simplifica", "simplificar",
+  "haz más limpio", "haz este código más limpio",
+  "limpia el código", "limpia este código",
+  "mejora el código", "mejora esta función",
+  // English
+  "refactor", "simplify", "clean up", "make cleaner",
+  "improve this code", "make this better", "clean this up",
+];
+
+export interface BugfixIntent {
+  filePath: string;
+  /** The user's instruction with the file reference stripped out. */
+  instruction: string;
+  /** True when the intent is a refactor/simplify request, not a bug fix. */
+  isRefactor: boolean;
+}
+
+/**
+ * Detects bugfix or refactor intent: user wants to fix a bug or improve
+ * existing code quality — not insert/append new content.
+ *
+ * Returns null when:
+ *   - no bugfix/refactor keywords are present
+ *   - no editable file path is found
+ */
+export function detectBugfixIntent(message: string): BugfixIntent | null {
+  const text = message.toLowerCase();
+
+  const hasRefactor = hasAny(text, REFACTOR_KEYWORDS);
+  const hasBugfix = hasAny(text, EDIT_KEYWORDS) && hasAny(text, BUGFIX_SPECIFIC_KEYWORDS);
+
+  if (!hasRefactor && !hasBugfix) return null;
+
+  const filePath = findEditableFilePath(message);
+  if (!filePath) return null;
+
+  const instruction = stripFileRef(message, filePath);
+  debug("bugfix", `bugfix(${filePath}) isRefactor=${hasRefactor}`);
+  return { filePath, instruction, isRefactor: hasRefactor };
+}
+
+/**
+ * Returns true when the message has edit/modify intent but no editable file path
+ * was found. Used to display a helpful "which file?" prompt instead of routing to
+ * the LLM which may refuse an edit request without file context.
+ */
+export function detectEditWithoutFileIntent(message: string): boolean {
+  const text = message.toLowerCase();
+  if (!hasAny(text, EDIT_KEYWORDS)) return false;
+  return findEditableFilePath(message) === null;
+}
+
+/**
+ * Detects write file intent (runs before read detection).
+ * Returns null if blocked (caller already checked via getBlockedWritePathError).
+ * Returns null if run keywords present — create+run is handled separately.
+ */
+function detectWriteIntent(message: string): AutoToolCall | null {
+  const text = message.toLowerCase();
+  if (!hasAny(text, WRITE_KEYWORDS)) return null;
+  // Don't intercept create+run flows (handled via detectCreateAndRunIntent)
+  if (hasAny(text, RUN_KEYWORDS)) return null;
+
+  for (const pattern of READ_PATTERNS) {
+    const m = message.match(pattern);
+    if (m?.[1]) {
+      const filePath = m[1].replace(/['"]/g, "");
+      // Skip log paths — let them fall through to read_log
+      if (isLogPath(filePath)) return null;
+      // Skip blocked paths — caller already surfaced error, return empty
+      if (isBlockedWritePath(filePath)) return null;
+
+      // Try explicit content patterns first
+      let content = "";
+      for (const cp of WRITE_CONTENT_PATTERNS) {
+        const cm = message.match(cp);
+        if (cm?.[1]) { content = cm[1].trim(); break; }
+      }
+
+      // Fallback: extract content after filename via "con ..." / "with ..."
+      if (!content) {
+        const fileIdx = message.indexOf(filePath);
+        if (fileIdx !== -1) {
+          const rest = message.slice(fileIdx + filePath.length);
+          const cm = rest.match(/^\s+con\s+(.+)$/i) ?? rest.match(/^\s+with\s+(.+)$/i);
+          if (cm?.[1]) content = cm[1].trim();
+        }
+      }
+
+      debug("write", `write_file(${filePath})`);
+      return { toolName: "write_file", args: { path: filePath, content }, label: `write ${filePath}` };
     }
   }
 
@@ -460,6 +858,15 @@ export function detectToolChain(message: string): AutoToolCall[] {
       return [{ toolName: "dns_lookup", args: { host }, label: `getent hosts ${host}` }];
     }
   }
+
+  // Edit intent — must run before write so "modifica archivo.css" → edit_file, not write_file.
+  const editCall = detectEditIntent(message);
+  if (editCall) return [editCall];
+
+  // Write intent — must run before read detection to prevent write → read_file misrouting.
+  // Priority: write_file > read_file
+  const writeCall = detectWriteIntent(message);
+  if (writeCall) return [writeCall];
 
   const lsCall = detectLsIntent(message);
   const readCall = detectReadIntent(message);
@@ -526,4 +933,242 @@ export function detectToolChain(message: string): AutoToolCall[] {
 
   debug("none", null);
   return [];
+}
+
+// ── Create + run intent ───────────────────────────────────────────────────────
+
+const CREATE_KEYWORDS: string[] = [
+  // Spanish
+  "crea", "crear", "escribe", "escribir", "genera", "generar", "haz", "hacer",
+  // English
+  "create", "write", "generate", "make",
+];
+
+const RUN_KEYWORDS: string[] = [
+  // Spanish
+  "ejecuta", "ejecutar", "ejecútalo", "ejecútala", "corre", "correr", "lanza", "lanzar",
+  // English
+  "run", "execute", "launch",
+];
+
+/** Maps file extension → interpreter command alias. */
+const EXT_TO_CMD: Readonly<Record<string, string>> = {
+  ".py":  "python3",
+  ".js":  "node",
+  ".mjs": "node",
+  ".c":   "gcc",
+  ".cpp": "g++",
+  ".cc":  "g++",
+};
+
+// ── Multi-file generation intent ─────────────────────────────────────────────
+
+/**
+ * Phrases that signal the user wants to create more than one file at once.
+ * Combined with CREATE_KEYWORDS to avoid false positives.
+ */
+const MULTI_FILE_INDICATORS: string[] = [
+  // Spanish — language combos
+  "html y css", "html y javascript", "html y js",
+  "css y js", "css y javascript",
+  "html, css", "css, js",
+  // Spanish — project/web nouns
+  "página web", "sitio web", "web básica", "web completa", "web mínima",
+  "app web", "aplicación web",
+  "varios archivos", "múltiples archivos", "varios ficheros",
+  "proyecto web", "proyecto completo",
+  // English — language combos
+  "html and css", "html and javascript", "html and js",
+  "css and js", "css and javascript",
+  "html, css",
+  // English — project/web nouns
+  "web page", "website", "basic web", "complete web",
+  "multiple files", "web project", "complete project",
+];
+
+/**
+ * Matches an explicit list of 2+ filenames like "index.html, styles.css y script.js".
+ * Allows comma or "y"/"and" as separators.
+ */
+const EXPLICIT_FILE_LIST_RE =
+  /\b[a-z0-9_\-.]+\.[a-z]{1,6}\b(?:\s*[,]\s*\b[a-z0-9_\-.]+\.[a-z]{1,6}\b)+/i;
+
+/**
+ * Returns true when the message contains create intent AND either:
+ * - A multi-file keyword indicator (e.g. "html y css", "sitio web"), OR
+ * - An explicit comma-separated list of 2+ filenames (e.g. "index.html, styles.css, script.js")
+ */
+export function detectMultiFileIntent(message: string): boolean {
+  const text = message.toLowerCase();
+  if (!hasAny(text, CREATE_KEYWORDS)) return false;
+  if (hasAny(text, MULTI_FILE_INDICATORS)) return true;
+  if (EXPLICIT_FILE_LIST_RE.test(text)) return true;
+  return false;
+}
+
+// ── Project scan intent ───────────────────────────────────────────────────────
+
+const PROJECT_SCAN_KEYWORDS: string[] = [
+  // Spanish
+  "revisa este proyecto", "revisa el proyecto",
+  "analiza este proyecto", "analiza el proyecto",
+  "cómo está el proyecto", "cómo está organizado",
+  "estructura del proyecto",
+  "overview del proyecto",
+  "qué archivos importantes",
+  "qué archivos hay en este",
+  "qué hay en este proyecto",
+  "escanea el proyecto",
+  "explora el proyecto",
+  "explica este proyecto",
+  "resumen del proyecto",
+  // English
+  "review this project", "review the project",
+  "analyze this project", "analyze the project",
+  "project overview",
+  "what files are here",
+  "scan this project",
+  "explore the project",
+  "explain this project",
+  "summarize this project",
+  "what's in this project",
+];
+
+/**
+ * Returns true when the user wants a high-level overview of the current project
+ * (scan structure, detect type, identify key files).
+ */
+export function detectProjectScanIntent(message: string): boolean {
+  const lower = message.toLowerCase();
+  return PROJECT_SCAN_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+// ── Multi-file read intent ────────────────────────────────────────────────────
+
+const MULTI_READ_RELATION_KEYWORDS: string[] = [
+  // Spanish
+  "conectado", "relacionado", "relación", "entre",
+  "cómo funciona", "cómo se relaciona", "cómo está",
+  "juntos", "depende", "vinculado", "interactúa",
+  // English
+  "connected", "related", "relationship", "between",
+  "how does", "how are", "together", "depends", "linked", "interacts",
+];
+
+/**
+ * Detects intent to read and compare multiple related files.
+ * Returns an ordered list of 2–4 filenames when intent is found, or null otherwise.
+ *
+ * Triggers when:
+ *   - The message contains 2+ filenames with extensions, AND
+ *   - A relational keyword is present OR the message is a question.
+ */
+export function detectMultiReadIntent(message: string): string[] | null {
+  const lower = message.toLowerCase();
+
+  const hasRelation = MULTI_READ_RELATION_KEYWORDS.some((kw) => lower.includes(kw));
+  const isQuestion  = lower.includes("?") || lower.startsWith("cómo") || lower.startsWith("how");
+  if (!hasRelation && !isQuestion) return null;
+
+  const FILE_RE = /\b([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]{1,6})\b/g;
+  const seen = new Set<string>();
+  const filenames: string[] = [];
+  let m: RegExpExecArray | null;
+
+  while ((m = FILE_RE.exec(message)) !== null) {
+    const name = m[1]!;
+    if (/^\d+\.\d+$/.test(name)) continue;   // skip version strings like "1.0"
+    if (!seen.has(name)) {
+      seen.add(name);
+      filenames.push(name);
+    }
+  }
+
+  if (filenames.length < 2) return null;
+  return filenames.slice(0, 4);
+}
+
+export interface CreateAndRunIntent {
+  filename: string;
+  cmd: string;
+}
+
+/**
+ * Returns create+run intent when the message contains both a create keyword
+ * and a run keyword, plus a filename whose extension maps to an allowed command.
+ */
+export function detectCreateAndRunIntent(message: string): CreateAndRunIntent | null {
+  const text = message.toLowerCase();
+  if (!hasAny(text, CREATE_KEYWORDS)) return null;
+  if (!hasAny(text, RUN_KEYWORDS)) return null;
+
+  for (const pattern of READ_PATTERNS) {
+    const match = message.match(pattern);
+    if (match?.[1]) {
+      const filename = match[1].replace(/['"]/g, "");
+      const ext = filename.slice(filename.lastIndexOf(".")).toLowerCase();
+      const cmd = EXT_TO_CMD[ext];
+      if (cmd) {
+        debug("create+run", `write_file(${filename}) → run_command(${cmd})`);
+        return { filename, cmd };
+      }
+    }
+  }
+
+  return null;
+}
+
+// ── Run + fix intent ──────────────────────────────────────────────────────────
+
+/**
+ * Keywords that signal the user wants errors corrected after running.
+ * Combined with RUN_KEYWORDS to identify run+fix intent.
+ * Deliberately specific to avoid colliding with pure bugfix detection.
+ */
+const RUN_FIX_KEYWORDS: string[] = [
+  // Spanish
+  "y arregla", "y corrige", "si falla", "y soluciona",
+  "arregla errores", "corrige errores", "arregla los errores",
+  "corrige los errores", "y arréglalo", "corríjelo si",
+  // English
+  "and fix", "fix if", "and correct", "fix errors", "fix issues",
+  "and fix errors", "and fix issues",
+];
+
+export interface RunAndFixIntent {
+  /** Filename to run, or null if the caller should infer from cwd. */
+  filePath: string | null;
+  /** Interpreter alias (python3, node, gcc, g++), or null if not yet determined. */
+  cmd: string | null;
+}
+
+/**
+ * Detects run+fix intent: user wants to execute a file and automatically
+ * repair any runtime error that results.
+ *
+ * Requires both a RUN keyword and a FIX keyword.
+ * Does NOT require a CREATE keyword — this distinguishes it from create+run.
+ * Checked before bugfix so "corre app.py si falla" routes here, not to bugfix.
+ */
+export function detectRunAndFixIntent(message: string): RunAndFixIntent | null {
+  const text = message.toLowerCase();
+  if (!hasAny(text, RUN_KEYWORDS)) return null;
+  if (!hasAny(text, RUN_FIX_KEYWORDS)) return null;
+
+  for (const pattern of READ_PATTERNS) {
+    const match = message.match(pattern);
+    if (match?.[1]) {
+      const filePath = match[1].replace(/['"]/g, "");
+      const ext = filePath.slice(filePath.lastIndexOf(".")).toLowerCase();
+      const cmd = EXT_TO_CMD[ext];
+      if (cmd) {
+        debug("run+fix", `run_command(${cmd} ${filePath}) → auto-fix on error`);
+        return { filePath, cmd };
+      }
+    }
+  }
+
+  // No explicit file found — caller will infer from cwd
+  debug("run+fix", "no explicit file — caller infers");
+  return { filePath: null, cmd: null };
 }

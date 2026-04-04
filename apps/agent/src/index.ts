@@ -20,6 +20,10 @@ import { KillProcessTool } from "./tools/actions/kill_process.js";
 import { PingHostTool } from "./tools/network/ping_host.js";
 import { DnsLookupTool } from "./tools/network/dns_lookup.js";
 import { HttpHeadCheckTool } from "./tools/network/http_head_check.js";
+import { WriteFileTool } from "./tools/files/write.js";
+import { EditFileTool } from "./tools/files/edit.js";
+import { RunCommandTool } from "./tools/execution/run_command.js";
+import { ScanProjectTool } from "./tools/project/scan.js";
 
 async function main(): Promise<void> {
   const logger = new Logger(config.logPath);
@@ -43,6 +47,10 @@ async function main(): Promise<void> {
   tools.register(new PingHostTool());
   tools.register(new DnsLookupTool());
   tools.register(new HttpHeadCheckTool());
+  tools.register(new WriteFileTool());
+  tools.register(new EditFileTool());
+  tools.register(new RunCommandTool());
+  tools.register(new ScanProjectTool());
 
   const agent = new Agent(logger, tools);
   const repl = new Repl(agent, logger, tools);

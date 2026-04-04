@@ -20,6 +20,7 @@ import { executePlan } from "../agent/planner/execute-plan.js";
 import { resolveProjectWorkspace, continueProjectWorkspace, findSimilarProjects, inferStackFromWorkspace, generateProjectReadme, appendTacticalImprovements, slugify, shouldUseCwdDirectly, cwdAsWorkspace } from "../agent/planner/workspace.js";
 import { buildProjectStateFromPlan, ensureProjectState, projectStateToExecutionPlan, refreshProjectStateFromPlan, writeProjectState } from "../agent/planner/project-state.js";
 import { assessWebStructuralRequirements, isLikelyWebStructuralInstruction } from "../agent/structural-edit/assess-structure.js";
+import { selectRebuildTemplate, buildTemplateContext } from "../agent/structural-edit/templates/selector.js";
 import { chat } from "../llm/ollama.js";
 import { evaluateAlerts, formatAlerts, formatAlertsCompact, AlertTracker } from "../alerts/engine.js";
 import { consoleNotifier, desktopNotifier, composeNotifiers } from "../alerts/notifier.js";
@@ -256,6 +257,71 @@ function formatStructuralAssessmentSummary(
       return `- ${f.key}: ${f.status} | ${f.reason}${evidence}`;
     })
     .join("\n");
+}
+
+// ── Structural rebuild fallback helpers ──────────────────────────────────────
+
+/**
+ * Returns true when the file is a candidate for a full write_file rebuild.
+ * Only HTML and CSS files qualify — JS is excluded (too risky to fully rewrite).
+ */
+function isRebuildFallbackTarget(filePath: string): boolean {
+  return /\.(html?|css)$/i.test(filePath);
+}
+
+/**
+ * Minimal sanity check for the LLM-generated rebuild content.
+ * Rejects empty output and content that doesn't resemble the expected file type.
+ */
+function isValidRebuildContent(content: string, filePath: string): boolean {
+  const trimmed = content.trim();
+  if (trimmed.length < 100) return false;
+  if (/\.html?$/i.test(filePath)) {
+    return /<html|<!DOCTYPE/i.test(trimmed);
+  }
+  if (/\.css$/i.test(filePath)) {
+    return trimmed.includes("{") && trimmed.includes("}");
+  }
+  return false;
+}
+
+/**
+ * Prompt asking the LLM to produce the COMPLETE rebuilt file (not SEARCH/REPLACE blocks).
+ * Used when edit_file failed to apply structural changes via patching.
+ */
+function buildWebRebuildPrompt(filePath: string, content: string, instruction: string): string {
+  const isHtml = /\.html?$/i.test(filePath);
+  const preserveRules = isHtml
+    ? [
+        '- Preserve the <link rel="stylesheet" href="styles.css"> tag.',
+        '- Preserve the <script src="script.js"></script> tag (or equivalent script tag).',
+        "- Preserve any existing login section (id=\"login-section\" or similar) and its form logic.",
+        "- Preserve any existing dashboard section (id=\"dashboard-section\" or similar) and its structure.",
+      ]
+    : [
+        "- Preserve all CSS custom properties (:root variables) if present.",
+        "- Preserve existing @keyframes definitions.",
+      ];
+
+  return `You are a web developer performing a full structural rebuild of the file below.
+The previous attempt to apply SEARCH/REPLACE patches to this file failed — the patches did not match.
+Generate the COMPLETE new file content that satisfies the structural instruction.
+
+RULES:
+- Output ONLY the raw file content. No explanations, no markdown code fences (no \`\`\`), no SEARCH/REPLACE markers.
+- The output must be a complete, valid ${isHtml ? "HTML" : "CSS"} file.
+${preserveRules.join("\n")}
+- Apply the full structural change described in the instruction.
+- Make it a real, working ${isHtml ? "web application" : "stylesheet"}.
+
+Current file: ${filePath}
+\`\`\`
+${content}
+\`\`\`
+
+Instruction: ${instruction}
+
+Output the complete rebuilt file content directly (raw — no fences, no markers):`;
 }
 
 function loadStructuralWebInputs(
@@ -1929,6 +1995,125 @@ export class Repl {
   }
 
   /**
+   * write_file fallback for structural web rebuilds.
+   *
+   * Activated when edit_file cannot apply SEARCH/REPLACE patches (0 blocks matched
+   * or NO_CHANGES_NEEDED after retry) AND the structural assessment confirms the
+   * target structure is not yet satisfied.
+   *
+   * Calls the LLM with a "generate complete file" prompt, validates the output,
+   * and overwrites the file via write_file (no confirm — automated structural path).
+   *
+   * Returns true on success, false on any failure (LLM error, invalid content, write error).
+   */
+  private async attemptStructuralRebuildFallback(
+    filePath: string,
+    fileContent: string,
+    instruction: string,
+    assessmentOverall: "satisfied" | "partial" | "insufficient",
+  ): Promise<boolean> {
+    if (assessmentOverall === "satisfied") return false;
+
+    // ── Premium template path (no LLM dependency) ────────────────────────────
+    if (/\.html?$/i.test(filePath)) {
+      const template = selectRebuildTemplate(instruction, fileContent);
+      if (template) {
+        const ctx     = buildTemplateContext(filePath, fileContent);
+        const content = template.build(ctx);
+        console.log(
+          `[rebuild] plantilla premium: ${template.id} · ${ctx.views.length} vistas · producto: "${ctx.productName}"\n`
+        );
+        this.logger.info(
+          `handleSemanticEdit: template rebuild — id=${template.id} views=[${ctx.views.join(",")}] — ${filePath}`
+        );
+        process.stdout.write(`[tool] write_file (template): ${filePath}\n`);
+        const writeResult = await this.tools.execute(
+          "write_file",
+          { path: filePath, content },
+          { cwd: process.cwd() }
+        );
+        if (!writeResult.error) {
+          const lineCount = content.split("\n").length;
+          console.log(
+            `[rebuild] ✔ ${path.basename(filePath)} reconstruido — plantilla ${template.id} · ${lineCount} líneas\n`
+          );
+          this.logger.info(
+            `handleSemanticEdit: template rebuild success — ${template.id} — ${lineCount} lines — ${filePath}`
+          );
+          this.agent.injectContext(
+            `Archivo reconstruido con plantilla premium: \`${filePath}\`\nTemplate: ${template.id} · Vistas: ${ctx.views.join(", ")}\nCambio: ${instruction}`
+          );
+          return true;
+        }
+        this.logger.warn(
+          `handleSemanticEdit: template write failed (${writeResult.error}), falling through to LLM — ${filePath}`
+        );
+      }
+    }
+    // ── LLM fallback path ────────────────────────────────────────────────────
+
+    console.log(
+      `[rebuild] edit_file no aplicó cambios · estado estructural: ${assessmentOverall}\n` +
+      `[rebuild] generando versión completa de ${path.basename(filePath)} con LLM...\n`
+    );
+    this.logger.info(
+      `handleSemanticEdit: write_file LLM fallback — assessment=${assessmentOverall} — ${filePath}`
+    );
+
+    const rebuildPrompt = buildWebRebuildPrompt(filePath, fileContent, instruction);
+    let rebuiltContent = "";
+    try {
+      for await (const token of chat([{ role: "user", content: rebuildPrompt }])) {
+        rebuiltContent += token;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`[error] LLM falló en rebuild: ${msg}\n`);
+      this.logger.error("handleSemanticEdit: write_file fallback LLM call failed", err);
+      return false;
+    }
+
+    // Strip accidental markdown code fences the LLM may include despite instructions
+    const stripped = rebuiltContent
+      .replace(/^```[a-z]*\r?\n?/im, "")
+      .replace(/\r?\n?```\s*$/im, "")
+      .trim();
+
+    if (!isValidRebuildContent(stripped, filePath)) {
+      console.log(
+        `[error] Rebuild inválido: el contenido generado no parece un archivo ${path.extname(filePath)} completo.\n`
+      );
+      this.logger.warn(`handleSemanticEdit: write_file fallback — content validation failed for: ${filePath}`);
+      return false;
+    }
+
+    process.stdout.write(`[tool] write_file (rebuild): ${filePath}\n`);
+    const writeResult = await this.tools.execute(
+      "write_file",
+      { path: filePath, content: stripped },
+      { cwd: process.cwd() }
+    );
+
+    if (writeResult.error) {
+      console.log(`[error] write_file falló: ${writeResult.error}\n`);
+      this.logger.warn(`handleSemanticEdit: write_file fallback write failed: ${writeResult.error}`);
+      return false;
+    }
+
+    const lineCount = stripped.split("\n").length;
+    console.log(
+      `[rebuild] ✔ ${path.basename(filePath)} reconstruido — ${lineCount} líneas · ${stripped.length} chars\n`
+    );
+    this.logger.info(
+      `handleSemanticEdit: write_file fallback success — ${lineCount} lines · ${stripped.length} chars — ${filePath}`
+    );
+    this.agent.injectContext(
+      `Archivo reconstruido completamente: \`${filePath}\`\nCambio estructural: ${instruction}`
+    );
+    return true;
+  }
+
+  /**
    * Semantic edit flow:
    * 1. Read the file
    * 2. Ask LLM (isolated call — does not pollute conversation history) to generate
@@ -2053,6 +2238,13 @@ export class Repl {
         }
 
         if (llmResponse.trim() === "NO_CHANGES_NEEDED") {
+          // Retry exhausted — attempt write_file full rebuild as last resort
+          if (isRebuildFallbackTarget(filePath)) {
+            const done = await this.attemptStructuralRebuildFallback(
+              filePath, fileContent, instruction, assessment.overall
+            );
+            if (done) return;
+          }
           console.log(
             `[error] Rebuild estructural no aplicado: la estructura actual es ${assessment.overall}.\n` +
             `${assessmentSummary}\n\n`
@@ -2109,6 +2301,17 @@ export class Repl {
       } else {
         console.log(`[error] El LLM no generó bloques de edición válidos.\n`);
         this.logger.warn(`handleSemanticEdit: no valid edit blocks in LLM response for: ${instruction}`);
+        // write_file fallback: structural web requests on .html/.css when LLM produced no blocks
+        if (isStructuralWebRequest && isRebuildFallbackTarget(filePath)) {
+          const structuralInputs = loadStructuralWebInputs(filePath, fileContent, instruction);
+          const noBlocksAssessment = assessWebStructuralRequirements(structuralInputs);
+          if (noBlocksAssessment.overall !== "satisfied") {
+            const done = await this.attemptStructuralRebuildFallback(
+              filePath, fileContent, instruction, noBlocksAssessment.overall
+            );
+            if (done) return;
+          }
+        }
         return;
       }
     }
@@ -2121,16 +2324,54 @@ export class Repl {
       { cwd: process.cwd() }
     );
 
+    const editMeta = editResult.editMeta;
+
     if (editResult.error) {
-      console.log(`[error] ${editResult.error}\n`);
-      this.logger.warn(`handleSemanticEdit: edit_file failed: ${editResult.error}`);
+      if (editMeta) {
+        console.log(
+          `[error] Edición no aplicada: 0/${editMeta.parsed} bloques encontraron match en ${filePath}\n` +
+          editResult.output + "\n"
+        );
+        this.logger.warn(
+          `handleSemanticEdit: edit_file 0/${editMeta.parsed} blocks matched — all failed for: ${filePath}`
+        );
+        // write_file fallback: only for structural web requests on .html/.css targets
+        if (isStructuralWebRequest && isRebuildFallbackTarget(filePath)) {
+          const structuralInputs = loadStructuralWebInputs(filePath, fileContent, instruction);
+          const editFailAssessment = assessWebStructuralRequirements(structuralInputs);
+          if (editFailAssessment.overall !== "satisfied") {
+            const done = await this.attemptStructuralRebuildFallback(
+              filePath, fileContent, instruction, editFailAssessment.overall
+            );
+            if (done) return;
+          }
+        }
+      } else {
+        console.log(`[error] ${editResult.error}\n`);
+        this.logger.warn(`handleSemanticEdit: edit_file failed: ${editResult.error}`);
+      }
       return;
     }
 
-    console.log(editResult.output + "\n");
+    if (editMeta && editMeta.failed > 0) {
+      console.log(
+        `[warn] Edición parcial en ${filePath}: ${editMeta.matched}/${editMeta.parsed} bloques aplicados` +
+        ` — ${editMeta.failed} no encontraron match · ±${editMeta.charsChanged} chars\n` +
+        editResult.output + "\n"
+      );
+      this.logger.warn(
+        `handleSemanticEdit: partial edit — ${editMeta.matched}/${editMeta.parsed} blocks matched,` +
+        ` ${editMeta.failed} failed · ±${editMeta.charsChanged} chars — ${filePath}`
+      );
+    } else {
+      console.log(editResult.output + "\n");
+      this.logger.info(
+        `handleSemanticEdit: ${filePath} — blocks: ${editMeta?.matched ?? "?"}/${editMeta?.parsed ?? "?"} · chars: ±${editMeta?.charsChanged ?? "?"}`
+      );
+    }
+
     // Brief context injection so the agent knows what changed
     this.agent.injectContext(`Archivo editado: \`${filePath}\`\nCambio: ${instruction}`);
-    this.logger.info(`handleSemanticEdit: ${filePath} — ${instruction}`);
   }
 
   /**
@@ -3052,18 +3293,45 @@ export class Repl {
       { cwd: process.cwd() }
     );
 
+    const editMeta = editResult.editMeta;
+
     if (editResult.error) {
-      console.log(`[error] ${editResult.error}\n`);
-      this.logger.warn(`handleBugfix: edit_file failed: ${editResult.error}`);
+      if (editMeta) {
+        console.log(
+          `[error] Fix no aplicado: 0/${editMeta.parsed} bloques encontraron match en ${filePath}\n` +
+          editResult.output + "\n"
+        );
+        this.logger.warn(
+          `handleBugfix: edit_file 0/${editMeta.parsed} blocks matched — all failed for: ${filePath}`
+        );
+      } else {
+        console.log(`[error] ${editResult.error}\n`);
+        this.logger.warn(`handleBugfix: edit_file failed: ${editResult.error}`);
+      }
       return;
     }
 
-    console.log(editResult.output + "\n");
+    if (editMeta && editMeta.failed > 0) {
+      console.log(
+        `[warn] Fix parcial en ${filePath}: ${editMeta.matched}/${editMeta.parsed} bloques aplicados` +
+        ` — ${editMeta.failed} no encontraron match · ±${editMeta.charsChanged} chars\n` +
+        editResult.output + "\n"
+      );
+      this.logger.warn(
+        `handleBugfix: partial fix — ${editMeta.matched}/${editMeta.parsed} blocks matched,` +
+        ` ${editMeta.failed} failed · ±${editMeta.charsChanged} chars — ${filePath}`
+      );
+    } else {
+      console.log(editResult.output + "\n");
+      this.logger.info(
+        `handleBugfix: ${filePath} — blocks: ${editMeta?.matched ?? "?"}/${editMeta?.parsed ?? "?"} · chars: ±${editMeta?.charsChanged ?? "?"}`
+      );
+    }
+
     const context = deterministicFixed
       ? `Sintaxis reparada y refactorizado: \`${filePath}\`\n${instruction}`
       : `Archivo corregido: \`${filePath}\`\nMejora: ${instruction}`;
     this.agent.injectContext(context);
-    this.logger.info(`handleBugfix: ${filePath} — ${instruction}`);
   }
 
   private async handleRestart(input: string): Promise<void> {
